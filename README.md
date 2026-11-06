@@ -2,13 +2,13 @@
 
 ## Project status
 
-Milestone 1 is complete. The pure literal search core, application wiring, and in-memory executable demo are implemented. Milestone 2 adds runtime file input and the first search CLI.
+Milestones 1 and 2 are complete. Single-file search supports buffered input, contextual errors, and exit codes. Milestone 3 adds dedicated CLI parsing and flags.
 
-The developer reported that all nine integration tests, `cargo fmt`, and `cargo clippy --all-targets --all-features` passed. The developer also confirmed the demo output. The AI reviewed the source but did not run these checks.
+The developer confirmed that all 31 Windows tests, `cargo fmt`, and `cargo clippy --all-targets --all-features` passed. The developer also confirmed the file-search output. The AI reviewed the source but did not run the checks.
 
 ## Overview
 
-mini-grep is a Rust learning project for local text search. The planned product is a standalone command-line tool.
+mini-grep is a standalone Rust command-line tool for local text search and a Rust learning project.
 
 ## Supported platforms
 
@@ -24,15 +24,15 @@ Run from the repository root.
 
 Terminal command (run from repository root)
 ```powershell
-cargo run
+cargo run -- Rust tests/fixtures/text/demo.txt
 ```
 
-The executable searches an embedded sample for `Rust`. It does not read a file at runtime.
+The executable opens the specified file at runtime and searches for `Rust`.
 
 Expected output (illustrative)
 ```text
-2:Rust makes ownership explicit.
-4:Rust rewards careful design.
+tests/fixtures/text/demo.txt:2:Rust makes ownership explicit.
+tests/fixtures/text/demo.txt:4:Rust rewards careful design.
 ```
 
 ## Implemented behavior and commands
@@ -46,7 +46,15 @@ The library exposes `mini_grep::search::search(pattern, text)` and `mini_grep::s
 - An empty pattern matches every line returned by `str::lines()`.
 - Empty input returns no results.
 
-The executable does not accept search arguments yet.
+The executable requires exactly two positional arguments: `mini-grep <PATTERN> <PATH>`. It searches one UTF-8 file with buffered, line-by-line input. It writes `path:line:text` to stdout and diagnostics to stderr. Paths remain native operating-system paths; displayed paths can replace invalid Unicode with replacement characters.
+
+| Exit status | Meaning |
+|---|---|
+| `0` | At least one matching line |
+| `1` | No matching lines |
+| `2` | Usage, open, read, or output error |
+
+On a read error, search stops. Previously printed matches remain on stdout and the final status is `2`. Invalid UTF-8 content is a read error. A non-UTF-8 pattern is a usage error.
 
 ## Examples
 
@@ -55,15 +63,18 @@ For pattern `Rust` and input `first\nRust is useful`, the library returns one re
 ## Design summary
 
 - `src/lib.rs` exposes the search module.
-- `src/main.rs` calls the library's `run` function and returns output errors.
-- `src/app.rs` connects the embedded sample, matcher, and terminal writer.
+- `src/main.rs` calls `run`, reports errors, and selects the exit status.
+- `src/app.rs` validates positional arguments and connects input, matching, and output.
+- `src/error.rs` preserves the operation, path, and underlying I/O error.
+- `src/input/reader.rs` opens files and yields numbered, owned lines.
 - `src/search/mod.rs` exposes the matcher and result type.
 - `src/search/literal.rs` searches in-memory UTF-8 text.
 - `src/search/result.rs` defines `LineMatch`.
-- `src/output/terminal.rs` writes `line_number:text` records and propagates write and flush errors.
+- `src/output/terminal.rs` writes `path:line:text` records and propagates write errors. The application flushes stdout.
 - `tests/search.rs` tests the public library interface without filesystem input.
 - `tests/app.rs` checks executable output, stderr, and successful exit status.
-- `tests/fixtures/text/demo.txt` supplies the sample embedded at compile time.
+- `tests/cli.rs` checks CLI edge cases and error exit statuses.
+- `tests/fixtures/text/demo.txt` supplies a file-search fixture.
 
 The search core performs no input or output. The caller owns the input and must keep it alive while using borrowed results.
 
@@ -71,7 +82,7 @@ The search core performs no input or output. The caller owns the input and must 
 
 Tests cover matching lines, absent patterns, case sensitivity, empty input, empty patterns, repeated occurrences, Unicode, and CRLF line endings.
 
-An executable integration test checks the full demo path. Output failure behavior is not yet covered by tests.
+CLI tests cover paths with spaces, usage errors, no matches, empty files and lines, missing files, directory input, invalid UTF-8, and partial output before a read error. A Windows-only test checks opening a file blocked by an exclusive handle. Unit tests cover simulated read and write failures and error sources. Unix-only tests for non-UTF-8 paths and patterns are present but have not been verified on Unix.
 
 Terminal command (run from repository root)
 ```powershell
@@ -82,11 +93,11 @@ cargo test --all-features
 
 ## Limitations
 
-The search core accepts `&str`, which requires valid UTF-8. It collects results in a `Vec`. Runtime file reading, CLI search, byte offsets, and streaming execution are not implemented. The demo uses Rust's default error exit behavior; the planned 0/1/2 search exit policy and broken-pipe handling are not implemented yet.
+The in-memory `search` API collects results in a `Vec`. The CLI processes one line at a time; a very long line can still require substantial memory. Search accepts UTF-8 content only. Flags, help/version, multiple files, directory traversal, stdin, regex, and byte offsets are not implemented. Arguments are currently positional, including values that begin with a hyphen. Broken pipes currently produce an output error and exit status `2`; pipeline-specific handling is planned for Milestone 7.
 
 ## Planned features
 
-Follow `roadmap.md` for milestone order: file input, CLI parsing, recursive discovery, regex, context, pipelines, parallel search, benchmarks, JSON, configuration, and releases.
+Follow `roadmap.md` for milestone order: dedicated CLI parsing and flags, recursive discovery, regex, context, pipelines, parallel search, benchmarks, JSON, configuration, and releases.
 
 TUI and local indexing are optional extensions after the production CLI.
 

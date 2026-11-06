@@ -1,20 +1,27 @@
 use std::process::Command;
 
 #[test]
-fn executable_prints_the_in_memory_search_results() {
-    let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
-        .output()
-        .expect("the demo executable should start");
+fn executable_searches_a_file() {
+    let path = "tests/fixtures/text/demo.txt";
 
-    assert!(
-        output.status.success(),
+    let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["Rust", path])
+        .output()
+        .expect("the executable should start");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
         "unexpected failure: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty());
 
-    assert_eq!(
-        output.stdout,
-        b"2:Rust makes ownership explicit.\n4:Rust rewards careful design.\n"
+    let expected = format!(
+        "{path}:2:Rust makes ownership explicit.\n\
+        {path}:4:Rust rewards careful design.\n"
     );
+
+    assert_eq!(output.stdout, expected.as_bytes());
 }
