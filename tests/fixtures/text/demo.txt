@@ -1,0 +1,4 @@
+Learning a new language.
+Rust makes ownership explicit.
+Small steps build understanding.
+Rust rewards careful design.
