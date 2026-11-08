@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod error;
 mod input;
 mod output;

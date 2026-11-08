@@ -6,6 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub enum AppError {
     Usage(&'static str),
+    Cli(Box<clap::Error>),
     Open { path: PathBuf, source: io::Error },
     Read { path: PathBuf, source: io::Error },
     Output(io::Error),
@@ -15,6 +16,7 @@ impl fmt::Display for AppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage(message) => write!(formatter, "{message}"),
+            Self::Cli(error) => fmt::Display::fmt(error, formatter),
             Self::Open { path, source } => {
                 write!(formatter, "cannot open '{}': {source}", path.display())
             }
@@ -32,6 +34,7 @@ impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Usage(_) => None,
+            Self::Cli(error) => Some(error.as_ref()),
             Self::Open { source, .. } | Self::Read { source, .. } | Self::Output(source) => {
                 Some(source)
             }

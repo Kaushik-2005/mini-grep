@@ -53,6 +53,7 @@ fn command() -> Command {
 
 fn search(pattern: &str, path: &Path) -> Output {
     command()
+        .arg("-n")
         .arg(pattern)
         .arg(path)
         .output()
@@ -127,10 +128,10 @@ fn invalid_argument_counts_return_two_and_usage() {
 
         assert_eq!(output.status.code(), Some(2), "arguments: {args:?}");
         assert!(output.stdout.is_empty());
-        assert_eq!(
-            output.stderr,
-            b"mini-grep: usage: mini-grep <PATTERN> <PATH>\n"
-        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.starts_with("error:"), "{stderr}");
+        assert!(stderr.contains("Usage:"), "{stderr}");
     }
 }
 
@@ -226,7 +227,9 @@ fn rejects_a_non_utf8_pattern() {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert_eq!(output.stderr, b"mini-grep: pattern must be valid UTF-8\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("error:"), "{stderr}");
+    assert!(stderr.contains("UTF-8"), "{stderr}");
 }
 
 #[cfg(windows)]
@@ -252,4 +255,193 @@ fn exclusively_locked_file_returns_two_without_panicking() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot open"), "{stderr}");
+}
+
+#[test]
+fn default_output_omits_line_numbers() {
+    let fixture = Fixture::new(b"first\nRust\n");
+
+    let output = command()
+        .arg("Rust")
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let expected = format!("{}:Rust\n", fixture.path.display());
+    assert_eq!(output.stdout, expected.as_bytes());
+}
+
+#[test]
+fn search_flags_work_in_short_long_and_combined_forms() {
+    let fixture = Fixture::new(b"Rust\nrust\nGo\n");
+    let path = fixture.path.display();
+
+    let cases = [
+        ("-i", format!("{path}:Rust\n{path}:rust\n")),
+        ("--ignore-case", format!("{path}:Rust\n{path}:rust\n")),
+        ("-n", format!("{path}:1:Rust\n")),
+        ("--line-number", format!("{path}:1:Rust\n")),
+        ("-v", format!("{path}:rust\n{path}:Go\n")),
+        ("--invert-match", format!("{path}:rust\n{path}:Go\n")),
+        ("-iFnv", format!("{path}:3:Go\n")),
+    ];
+
+    for (flag, expected) in cases {
+        let output = command()
+            .args([flag, "Rust"])
+            .arg(&fixture.path)
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(output.status.code(), Some(0), "flag: {flag}");
+        assert!(output.stderr.is_empty(), "flag: {flag}");
+        assert_eq!(output.stdout, expected.as_bytes(), "flag: {flag}");
+    }
+}
+
+#[test]
+fn ignores_unicode_case_without_changing_output_text() {
+    let fixture = Fixture::new("Un café\n".as_bytes());
+
+    let output = command()
+        .args(["-i", "CAFÉ"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let expected = format!("{}:Un café\n", fixture.path.display());
+    assert_eq!(output.stdout, expected.as_bytes());
+}
+
+#[test]
+fn default_and_fixed_string_modes_treat_metacharacters_literally() {
+    let fixture = Fixture::new(b"plain\ndot . here\n");
+    let cases: &[&[&str]] = &[&[], &["-F"], &["--fixed-strings"]];
+
+    for flags in cases {
+        let output = command()
+            .args(*flags)
+            .arg(".")
+            .arg(&fixture.path)
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+
+        let expected = format!("{}:dot . here\n", fixture.path.display());
+        assert_eq!(output.stdout, expected.as_bytes());
+    }
+}
+
+#[test]
+fn inverted_empty_pattern_selects_no_lines() {
+    let fixture = Fixture::new(b"Rust\n\nGo\n");
+
+    for flag in ["-v", "--invert-match", "-iv"] {
+        let output = command()
+            .args([flag, ""])
+            .arg(&fixture.path)
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(output.status.code(), Some(1), "flag: {flag}");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn help_and_version_succeed_without_search_arguments() {
+    let help = command()
+        .arg("--help")
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(help.status.code(), Some(0));
+    assert!(help.stderr.is_empty());
+
+    let stdout = String::from_utf8_lossy(&help.stdout);
+
+    for expected in [
+        "Usage:",
+        "<PATTERN>",
+        "<PATH>",
+        "--ignore-case",
+        "--fixed-strings",
+        "--line-number",
+        "--invert-match",
+        "--help",
+        "--version",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+
+    for flag in ["--version", "-V"] {
+        let version = command().arg(flag).output().expect("executable must start");
+
+        assert_eq!(version.status.code(), Some(0));
+        assert!(version.stderr.is_empty());
+
+        let expected = format!("mini-grep {}\n", env!("CARGO_PKG_VERSION"));
+        assert_eq!(version.stdout, expected.as_bytes());
+    }
+}
+
+#[test]
+fn rejects_unknown_reserved_and_repeated_flags() {
+    let fixture = Fixture::new(b"Rust\n");
+
+    for flag in ["--unknown", "-h", "--line-numbers", "-ii"] {
+        let output = command()
+            .args([flag, "Rust"])
+            .arg(&fixture.path)
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(output.status.code(), Some(2), "flag: {flag}");
+        assert!(output.stdout.is_empty());
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.starts_with("error:"), "{stderr}");
+        assert!(stderr.contains("Usage:"), "{stderr}");
+    }
+}
+
+#[test]
+fn separator_allows_a_pattern_beginning_with_a_hyphen() {
+    let fixture = Fixture::new(b"plain\n-needle\n");
+
+    let output = command()
+        .args(["--", "-needle"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let expected = format!("{}:-needle\n", fixture.path.display());
+    assert_eq!(output.stdout, expected.as_bytes());
+}
+
+#[test]
+fn empty_path_returns_a_usage_error() {
+    let output = command()
+        .args(["Rust", ""])
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("error:"), "{stderr}");
+    assert!(stderr.contains("<PATH>"), "{stderr}");
 }

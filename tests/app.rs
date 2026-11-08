@@ -6,7 +6,7 @@ fn executable_searches_a_file() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["Rust", path])
+        .args(["-n", "Rust", path])
         .output()
         .expect("the executable should start");
 

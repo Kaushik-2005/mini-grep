@@ -1,6 +1,6 @@
 mod literal;
 mod result;
 
-pub(crate) use literal::matches_line;
 pub use literal::search;
+pub(crate) use literal::{CaseSensitivity, LiteralMatcher, Selection};
 pub use result::LineMatch;
