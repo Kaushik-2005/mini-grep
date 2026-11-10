@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use super::args::Args;
 use crate::AppError;
+use crate::discovery::DiscoveryOptions;
 
 #[derive(Debug)]
 pub(crate) struct Config {
@@ -10,6 +11,7 @@ pub(crate) struct Config {
     pub(crate) ignore_case: bool,
     pub(crate) line_numbers: bool,
     pub(crate) invert_match: bool,
+    pub(crate) discovery: DiscoveryOptions,
 }
 
 impl TryFrom<Args> for Config {
@@ -26,6 +28,17 @@ impl TryFrom<Args> for Config {
             ignore_case: args.ignore_case,
             line_numbers: args.line_numbers,
             invert_match: args.invert_match,
+            discovery: DiscoveryOptions {
+                include_hidden: args.hidden,
+                ignore_files: !args.no_ignore,
+                vcs_ignore_files: !(args.no_ignore || args.no_ignore_vcs),
+                max_depth: args.max_depth,
+                max_filesize: args.max_filesize,
+                globs: args.globs,
+                file_types: args.file_types,
+                excluded_types: args.excluded_types,
+                follow_links: args.follow,
+            },
         })
     }
 }

@@ -6,7 +6,7 @@ use clap::{ArgAction, Parser};
 #[command(
     name = "mini-grep",
     version,
-    about = "Search one UTF-8 file for literal text.",
+    about = "Search UTF-8 files in a file or directory for literal text.",
     disable_help_flag = true
 )]
 pub(crate) struct Args {
@@ -14,7 +14,7 @@ pub(crate) struct Args {
     #[arg(value_name = "PATTERN")]
     pub(crate) pattern: String,
 
-    /// File to search
+    /// File or directory to search
     #[arg(value_name = "PATH")]
     pub(crate) path: PathBuf,
 
@@ -33,6 +33,42 @@ pub(crate) struct Args {
     /// Select lines that do not match
     #[arg(short = 'v', long)]
     pub(crate) invert_match: bool,
+
+    /// Include hidden files and directories
+    #[arg(long)]
+    pub(crate) hidden: bool,
+
+    /// Disable all supported ignore-file rules
+    #[arg(long)]
+    pub(crate) no_ignore: bool,
+
+    /// Disable Git ignore rules while retaining .ignore rules
+    #[arg(long)]
+    pub(crate) no_ignore_vcs: bool,
+
+    /// Maximum traversal depth, with the supplied root at depth 0
+    #[arg(long, value_name = "DEPTH")]
+    pub(crate) max_depth: Option<usize>,
+
+    /// Maximum searched file size in bytes, inclusive
+    #[arg(long, value_name = "BYTES")]
+    pub(crate) max_filesize: Option<u64>,
+
+    /// Include matching paths; prefix with ! to exclude; later matches win
+    #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+    pub(crate) globs: Vec<String>,
+
+    /// Include a built-in file type; repeat to include more types
+    #[arg(long = "type", value_name = "TYPE")]
+    pub(crate) file_types: Vec<String>,
+
+    /// Exclude a built-in file type; exclusions take precedence
+    #[arg(long = "type-not", value_name = "TYPE")]
+    pub(crate) excluded_types: Vec<String>,
+
+    /// Follow symbolic links and report broken links or loops
+    #[arg(short = 'L', long)]
+    pub(crate) follow: bool,
 
     /// Print help
     #[arg(long, action = ArgAction::Help)]

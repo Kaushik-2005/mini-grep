@@ -1,12 +1,13 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use mini_grep::AppError;
+use mini_grep::{AppError, SearchOutcome};
 
 fn main() -> ExitCode {
     match mini_grep::run() {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(1),
+        Ok(SearchOutcome::Selected) => ExitCode::SUCCESS,
+        Ok(SearchOutcome::NoSelection) => ExitCode::from(1),
+        Ok(SearchOutcome::Errors) => ExitCode::from(2),
         Err(AppError::Cli(error)) => {
             let code = if error.exit_code() == 0 { 0 } else { 2 };
 

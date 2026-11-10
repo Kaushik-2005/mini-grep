@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub enum AppError {
     Usage(&'static str),
     Cli(Box<clap::Error>),
+    Discovery(Box<ignore::Error>),
     Open { path: PathBuf, source: io::Error },
     Read { path: PathBuf, source: io::Error },
     Output(io::Error),
@@ -17,6 +18,9 @@ impl fmt::Display for AppError {
         match self {
             Self::Usage(message) => write!(formatter, "{message}"),
             Self::Cli(error) => fmt::Display::fmt(error, formatter),
+            Self::Discovery(error) => {
+                write!(formatter, "cannot discover files: {error}")
+            }
             Self::Open { path, source } => {
                 write!(formatter, "cannot open '{}': {source}", path.display())
             }
@@ -35,6 +39,7 @@ impl Error for AppError {
         match self {
             Self::Usage(_) => None,
             Self::Cli(error) => Some(error.as_ref()),
+            Self::Discovery(error) => Some(error.as_ref()),
             Self::Open { source, .. } | Self::Read { source, .. } | Self::Output(source) => {
                 Some(source)
             }

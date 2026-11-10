@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::AppError;
 use crate::search::LineMatch;
 
 pub(crate) fn write_match(
@@ -20,6 +21,10 @@ pub(crate) fn write_match(
     } else {
         writeln!(writer, "{}:{}", path.display(), matched_line.text)
     }
+}
+
+pub(crate) fn write_diagnostic(writer: &mut impl Write, error: &AppError) -> io::Result<()> {
+    writeln!(writer, "mini-grep: {error}")
 }
 
 #[cfg(test)]
@@ -95,5 +100,34 @@ mod tests {
 
             assert_eq!(error.kind(), io::ErrorKind::WriteZero);
         }
+    }
+
+    #[test]
+    fn writes_a_contextual_error_diagnostic() -> io::Result<()> {
+        let mut output = Vec::new();
+        let error = AppError::Read {
+            path: Path::new("sample.txt").to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8"),
+        };
+
+        write_diagnostic(&mut output, &error)?;
+
+        assert_eq!(
+            output,
+            b"mini-grep: cannot read 'sample.txt': invalid UTF-8\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn propagates_diagnostic_write_errors() {
+        let mut output: &mut [u8] = &mut [];
+        let error = AppError::Usage("invalid arguments");
+
+        let failure = write_diagnostic(&mut output, &error)
+            .expect_err("an empty fixed-size buffer cannot accept output");
+
+        assert_eq!(failure.kind(), io::ErrorKind::WriteZero);
     }
 }

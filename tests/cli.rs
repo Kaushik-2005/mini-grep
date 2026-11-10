@@ -145,23 +145,19 @@ fn missing_file_returns_two_with_path_context() {
     assert!(output.stdout.is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("cannot open"), "{stderr}");
+    assert!(stderr.contains("cannot discover files"), "{stderr}");
 }
 
 #[test]
-fn directory_input_returns_two_without_panicking() {
-    let fixture = Fixture::new(b"");
+fn directory_input_searches_its_files() {
+    let fixture = Fixture::new(b"Rust\n");
     let output = search("Rust", &fixture.directory);
 
-    assert_operational_error(&output, &fixture.directory);
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
 
-    // Platforms may reject the directory during opening or during reading.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("cannot open") || stderr.contains("cannot read"),
-        "{stderr}"
-    );
+    let expected = format!("{}:1:Rust\n", fixture.path.display());
+    assert_eq!(output.stdout, expected.as_bytes());
 }
 
 #[test]
