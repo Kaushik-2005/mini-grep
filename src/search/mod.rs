@@ -1,6 +1,10 @@
 mod literal;
+mod pattern;
+mod regex;
 mod result;
 
 pub use literal::search;
-pub(crate) use literal::{CaseSensitivity, LiteralMatcher, Selection};
-pub use result::LineMatch;
+pub(crate) use pattern::{
+    CaseMode, MatchScope, PatternMatcher, PatternMode, PatternOptions, Selection,
+};
+pub use result::{LineMatch, MatchSpan};

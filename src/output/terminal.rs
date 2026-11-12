@@ -37,6 +37,7 @@ mod tests {
         let matched_line = LineMatch {
             line_number: 7,
             text: "नमस्ते Rust",
+            spans: Vec::new(),
         };
 
         write_match(
@@ -57,6 +58,7 @@ mod tests {
         let matched_line = LineMatch {
             line_number: 7,
             text: "Rust",
+            spans: Vec::new(),
         };
 
         write_match(&mut output, Path::new("sample.txt"), &matched_line, false)?;
@@ -72,6 +74,7 @@ mod tests {
         let matched_line = LineMatch {
             line_number: 2,
             text: "",
+            spans: Vec::new(),
         };
 
         write_match(&mut output, Path::new("sample.txt"), &matched_line, false)?;
@@ -88,6 +91,7 @@ mod tests {
             let matched_line = LineMatch {
                 line_number: 1,
                 text: "Rust",
+                spans: Vec::new(),
             };
 
             let error = write_match(

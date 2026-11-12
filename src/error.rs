@@ -11,6 +11,7 @@ pub enum AppError {
     Open { path: PathBuf, source: io::Error },
     Read { path: PathBuf, source: io::Error },
     Output(io::Error),
+    Pattern(Box<::regex::Error>),
 }
 
 impl fmt::Display for AppError {
@@ -30,6 +31,9 @@ impl fmt::Display for AppError {
             Self::Output(source) => {
                 write!(formatter, "cannot write output: {source}")
             }
+            Self::Pattern(error) => {
+                write!(formatter, "invalid search pattern: {error}")
+            }
         }
     }
 }
@@ -43,6 +47,7 @@ impl Error for AppError {
             Self::Open { source, .. } | Self::Read { source, .. } | Self::Output(source) => {
                 Some(source)
             }
+            Self::Pattern(error) => Some(error.as_ref()),
         }
     }
 }
