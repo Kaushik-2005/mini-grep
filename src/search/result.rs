@@ -32,6 +32,21 @@ impl MatchSpan {
     }
 }
 
+/// An owned input line with its selection decision and original byte spans.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SearchLine {
+    pub(crate) line_number: usize,
+    pub(crate) text: String,
+    pub(crate) spans: Vec<MatchSpan>,
+    pub(crate) selected: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SearchEvent {
+    Line(SearchLine),
+    GroupBreak,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

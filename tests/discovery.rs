@@ -1023,3 +1023,424 @@ mod symlink_tests {
         assert!(stderr.contains(locked_path.as_str()), "{stderr}");
     }
 }
+
+#[test]
+fn context_state_resets_between_files() {
+    let fixture = Fixture::new();
+    let first = fixture.write("first.txt", b"before first\nRust\n");
+    let second = fixture.write(
+        "nested/second.txt",
+        b"omitted\nbefore second\nRust\nafter second\nomitted\n",
+    );
+    fixture.write("no-match.txt", b"never emitted\n");
+
+    let output = fixture.search_with(&["-C", "1"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let first_group = format!(
+        "{}-1-before first\n{}:2:Rust\n",
+        first.display(),
+        first.display(),
+    );
+    let second_group = format!(
+        "{}-2-before second\n{}:3:Rust\n{}-4-after second\n",
+        second.display(),
+        second.display(),
+        second.display(),
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("fixture output must be valid UTF-8");
+
+    assert!(
+        stdout == format!("{first_group}{second_group}")
+            || stdout == format!("{second_group}{first_group}"),
+        "unexpected output: {stdout:?}"
+    );
+}
+
+#[test]
+fn global_limit_is_shared_while_per_file_limits_reset() {
+    let fixture = Fixture::new();
+    let first = fixture.write("first.txt", b"Rust\nRust\nRust\n");
+    let second = fixture.write("second.txt", b"Rust\nRust\nRust\n");
+
+    let output = fixture.search_with(&["-m", "2", "--max-results", "3"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let first = first.display();
+    let second = second.display();
+
+    let first_then_second = format!(
+        "{first}:1:Rust\n\
+        {first}:2:Rust\n\
+        {second}:1:Rust\n"
+    );
+    let second_then_first = format!(
+        "{second}:1:Rust\n\
+        {second}:2:Rust\n\
+        {first}:1:Rust\n"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("fixture output must be valid UTF-8");
+
+    assert!(
+        stdout == first_then_second || stdout == second_then_first,
+        "unexpected output: {stdout:?}"
+    );
+}
+
+#[test]
+fn global_limit_preserves_trailing_read_errors_and_stops_other_files() {
+    let fixture = Fixture::new();
+    let first = fixture.write("first.txt", b"Rust\n\xff\n");
+    let second = fixture.write("second.txt", b"Rust\n\xff\n");
+
+    let output = fixture.search_with(&["--max-results", "1", "-A", "1"]);
+
+    assert_eq!(output.status.code(), Some(2));
+
+    let stdout =
+        String::from_utf8(output.stdout).expect("printed fixture text must be valid UTF-8");
+
+    let first_output = format!("{}:1:Rust\n", first.display());
+    let second_output = format!("{}:1:Rust\n", second.display());
+
+    let (searched, unsearched) = if stdout == first_output {
+        (&first, &second)
+    } else {
+        assert_eq!(stdout, second_output);
+        (&second, &first)
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let searched_path = searched.display().to_string();
+    let unsearched_path = unsearched.display().to_string();
+
+    assert!(stderr.contains("cannot read"), "{stderr}");
+    assert!(stderr.contains(searched_path.as_str()), "{stderr}");
+    assert!(!stderr.contains(unsearched_path.as_str()), "{stderr}");
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
+#[test]
+fn quiet_selection_preserves_an_earlier_discovery_error() {
+    let fixture = Fixture::new();
+    let ignore_file = fixture.write(".ignore", b"\xff\n");
+    let target = fixture.write("target.txt", b"Rust\n\xff\n");
+
+    let output = fixture.search_with(&["-q"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let ignore_path = ignore_file.display().to_string();
+    let target_path = target.display().to_string();
+
+    assert!(stderr.contains(ignore_path.as_str()), "{stderr}");
+    assert!(!stderr.contains(target_path.as_str()), "{stderr}");
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+
+    let without_ignore = fixture.search_with(&["-q", "--no-ignore"]);
+
+    assert_eq!(without_ignore.status.code(), Some(0));
+    assert!(without_ignore.stdout.is_empty());
+    assert!(
+        without_ignore.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&without_ignore.stderr)
+    );
+}
+
+#[test]
+fn file_list_modes_report_qualifying_files_across_a_directory() {
+    let fixture = Fixture::new();
+    let matching = fixture.write("matching.txt", b"Rust\nRust\n");
+    let nonmatching = fixture.write("nested/nonmatching.txt", b"Go\n");
+    let empty = fixture.write("empty.txt", b"");
+
+    let cases = [
+        ("-l", vec![matching]),
+        ("--files-without-match", vec![nonmatching, empty]),
+    ];
+
+    for (flag, paths) in cases {
+        let output = fixture.search_with(&[flag, "-C", "2"]);
+
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("fixture output must be valid UTF-8");
+        let mut actual: Vec<_> = stdout.lines().map(str::to_owned).collect();
+        let mut expected: Vec<_> = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+
+        let quiet = fixture.search_with(&[flag, "-q"]);
+
+        assert_eq!(quiet.status.code(), Some(0));
+        assert!(quiet.stdout.is_empty());
+        assert!(
+            quiet.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&quiet.stderr)
+        );
+    }
+}
+
+#[test]
+fn file_list_modes_obey_zero_and_global_selection_limits() {
+    let fixture = Fixture::new();
+    let first = fixture.write("first.txt", b"Rust\n\xff\n");
+    let second = fixture.write("second.txt", b"Rust\n\xff\n");
+
+    for flag in ["-l", "--files-without-match"] {
+        for limit_flag in ["-m", "--max-results"] {
+            let output = fixture.search_with(&[flag, limit_flag, "0"]);
+
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let output = fixture.search_with(&[flag, "--max-results", "1"]);
+
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        if flag == "-l" {
+            assert_eq!(output.status.code(), Some(0));
+
+            let first_path = format!("{}\n", first.display());
+            let second_path = format!("{}\n", second.display());
+
+            assert!(
+                output.stdout == first_path.as_bytes() || output.stdout == second_path.as_bytes(),
+                "unexpected output: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+        }
+    }
+}
+
+#[test]
+fn count_modes_preserve_completed_records_when_another_file_fails() {
+    let fixture = Fixture::new();
+    let matching = fixture.write("matching.txt", b"Rust Rust\nRust\n");
+    let nonmatching = fixture.write("nonmatching.txt", b"Go\n");
+    let empty = fixture.write("empty.txt", b"");
+    let broken = fixture.write("broken.txt", b"Rust\n\xff\n");
+
+    for (mode, matching_count) in [("-c", 2), ("--count-matches", 3)] {
+        let output = fixture.search_with(&[mode]);
+
+        assert_eq!(output.status.code(), Some(2));
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let broken_path = broken.display().to_string();
+        assert!(stderr.contains("cannot read"), "{stderr}");
+        assert!(stderr.contains(broken_path.as_str()), "{stderr}");
+
+        let stdout = String::from_utf8(output.stdout).expect("fixture output must be valid UTF-8");
+        let mut actual: Vec<_> = stdout.lines().map(str::to_owned).collect();
+        let mut expected = vec![
+            format!("{}:{matching_count}", matching.display()),
+            format!("{}:0", nonmatching.display()),
+            format!("{}:0", empty.display()),
+        ];
+
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn count_modes_share_global_limits_and_reset_per_file_limits() {
+    let fixture = Fixture::new();
+    let first = fixture.write("first.txt", b"Rust Rust\nRust\nRust\n");
+    let second = fixture.write("second.txt", b"Rust Rust\nRust\nRust\n");
+
+    for (mode, full_count, partial_count) in [("-c", 2, 1), ("--count-matches", 3, 2)] {
+        let output = fixture.search_with(&[mode, "-m", "2", "--max-results", "3"]);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+
+        let stdout = String::from_utf8(output.stdout).expect("fixture output must be valid UTF-8");
+        let mut actual: Vec<_> = stdout.lines().map(str::to_owned).collect();
+
+        let mut first_then_second = vec![
+            format!("{}:{full_count}", first.display()),
+            format!("{}:{partial_count}", second.display()),
+        ];
+        let mut second_then_first = vec![
+            format!("{}:{partial_count}", first.display()),
+            format!("{}:{full_count}", second.display()),
+        ];
+
+        actual.sort();
+        first_then_second.sort();
+        second_then_first.sort();
+
+        assert!(
+            actual == first_then_second || actual == second_then_first,
+            "unexpected records: {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn match_only_output_shares_global_limits_and_resets_per_file_limits() {
+    let fixture = Fixture::new();
+    let first = fixture.write("first.txt", b"Rust Rust\nRust\n\xff\n");
+    let second = fixture.write("second.txt", b"Rust Rust\nRust\n\xff\n");
+
+    let output = fixture.search_with(&["-o", "-m", "2", "--max-results", "3", "-A", "3"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let records = |path: &PathBuf, includes_second_line: bool| {
+        let path = path.display();
+        let mut text = format!("{path}:1:Rust\n{path}:1:Rust\n");
+
+        if includes_second_line {
+            text.push_str(&format!("{path}:2:Rust\n"));
+        }
+
+        text
+    };
+
+    let first_then_second = format!("{}{}", records(&first, true), records(&second, false),);
+    let second_then_first = format!("{}{}", records(&second, true), records(&first, false),);
+
+    let stdout = String::from_utf8(output.stdout).expect("fixture output must be valid UTF-8");
+
+    assert!(
+        stdout == first_then_second || stdout == second_then_first,
+        "unexpected output: {stdout:?}"
+    );
+}
+
+#[test]
+fn headings_separate_visible_files_without_groups_for_empty_results() {
+    let fixture = Fixture::new();
+    let first = fixture.write("first.txt", b"Rust\nRust\n");
+    let second = fixture.write("nested/second.txt", b"Go\nRust\n");
+    fixture.write("no-match.txt", b"Go\n");
+    fixture.write("empty.txt", b"");
+
+    for flags in [vec!["--heading"], vec!["--heading", "-o"]] {
+        let output = fixture.search_with(&flags);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+
+        let first_group = format!("{}\n1:Rust\n2:Rust\n", first.display());
+        let second_group = format!("{}\n2:Rust\n", second.display());
+
+        let stdout = String::from_utf8(output.stdout).expect("fixture output must be valid UTF-8");
+
+        assert!(
+            stdout == format!("{first_group}\n{second_group}")
+                || stdout == format!("{second_group}\n{first_group}"),
+            "unexpected output: {stdout:?}"
+        );
+    }
+}
+
+#[test]
+fn null_file_lists_emit_complete_paths_without_newline_delimiters() {
+    let fixture = Fixture::new();
+    let first = fixture.write("first file.txt", b"Rust\n");
+    let second = fixture.write("nested/second.txt", b"Rust\n");
+    let nonmatching = fixture.write("other.txt", b"Go\n");
+    let empty = fixture.write("empty.txt", b"");
+
+    let cases = [
+        ("-l", vec![first, second]),
+        ("--files-without-match", vec![nonmatching, empty]),
+    ];
+
+    for (mode, paths) in cases {
+        let output = fixture.search_with(&["-0", mode]);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+
+        let mut actual: Vec<Vec<u8>> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .map(<[u8]>::to_vec)
+            .collect();
+
+        assert_eq!(actual.pop(), Some(Vec::new()));
+
+        let mut expected: Vec<Vec<u8>> = paths
+            .iter()
+            .map(|path| {
+                path.to_str()
+                    .expect("fixture paths must be valid Unicode")
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect();
+
+        actual.sort();
+        expected.sort();
+
+        assert_eq!(actual, expected);
+    }
+}

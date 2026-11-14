@@ -88,6 +88,95 @@ pub(crate) struct Args {
     #[arg(short = 'f', long = "file", value_name = "FILE")]
     pub(crate) pattern_files: Vec<PathBuf>,
 
+    /// Include this many lines after each selected line
+    #[arg(short = 'A', long, value_name = "NUM")]
+    pub(crate) after_context: Option<usize>,
+
+    /// Include this many lines before each selected line
+    #[arg(short = 'B', long, value_name = "NUM")]
+    pub(crate) before_context: Option<usize>,
+
+    /// Include this many lines before and after each selected line
+    #[arg(short = 'C', long, value_name = "NUM")]
+    pub(crate) context: Option<usize>,
+
+    /// Stop selecting lines in each file after this count
+    #[arg(short = 'm', long, value_name = "NUM")]
+    pub(crate) max_count: Option<usize>,
+
+    /// Stop selecting lines across the search after this count
+    #[arg(long, value_name = "NUM")]
+    pub(crate) max_results: Option<usize>,
+
+    /// Print no results and stop at the first selected line
+    #[arg(short = 'q', long)]
+    pub(crate) quiet: bool,
+
+    /// Print each file path once if it contains a selected line
+    #[arg(short = 'l', long, conflicts_with = "files_without_match")]
+    pub(crate) files_with_matches: bool,
+
+    /// Print each file path once if it contains no selected lines
+    #[arg(long)]
+    pub(crate) files_without_match: bool,
+
+    /// Print the number of selected lines in each file
+    #[arg(
+        short = 'c',
+        long,
+        conflicts_with_all = [
+            "count_matches",
+            "files_with_matches",
+            "files_without_match",
+        ]
+    )]
+    pub(crate) count: bool,
+
+    /// Print the number of match spans in each files
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "files_with_matches",
+            "files_without_match",
+            "invert_match",
+        ]
+    )]
+    pub(crate) count_matches: bool,
+
+    /// Print each nonempty matched span instead of the full time
+    #[arg(
+        short = 'o',
+        long,
+        conflicts_with_all = [
+            "files_with_matches",
+            "files_without_match",
+            "count",
+            "count_matches",
+            "invert_match",
+        ]
+    )]
+    pub(crate) only_matching: bool,
+
+    /// Include filenames in line and count output
+    #[arg(short = 'H', long, conflicts_with = "no_filename")]
+    pub(crate) with_filename: bool,
+
+    /// Omit filenames from line and count output
+    #[arg(short = 'h', long)]
+    pub(crate) no_filename: bool,
+
+    /// Group line and match-only results beneath each file path
+    #[arg(long, conflicts_with = "no_filename")]
+    pub(crate) heading: bool,
+
+    /// Include one-based byte columns and line numbers
+    #[arg(long)]
+    pub(crate) column: bool,
+
+    /// Write a NUL byte after each emitted filename
+    #[arg(short = '0', long, conflicts_with = "heading")]
+    pub(crate) null: bool,
+
     /// Print help
     #[arg(long, action = ArgAction::Help)]
     pub(crate) help: Option<bool>,
@@ -148,14 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn reserves_short_h_instead_of_using_it_for_help() {
-        let error =
-            Args::try_parse_from(["mini-grep", "-h"]).expect_err("-h is not implemented yet");
-
-        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
-    }
-
-    #[test]
     fn help_does_not_require_search_arguments() {
         let error = Args::try_parse_from(["mini-grep", "--help"])
             .expect_err("help is returned as a display request");
@@ -209,5 +290,15 @@ mod tests {
 
             assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
         }
+    }
+
+    #[test]
+    fn short_h_controls_filenames_instead_of_displaying_help() {
+        let args = Args::try_parse_from(["mini-grep", "-h", "Rust", "sample.txt"])
+            .expect("-h must parse as a filename option");
+
+        assert!(args.no_filename);
+        assert!(!args.with_filename);
+        assert_eq!(args.help, None);
     }
 }
