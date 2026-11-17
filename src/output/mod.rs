@@ -1,3 +1,4 @@
+pub(crate) mod color;
 pub(crate) mod terminal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,7 @@ pub(crate) struct TerminalOptions {
     pub(crate) show_filename: bool,
     pub(crate) column: bool,
     pub(crate) null: bool,
+    pub(crate) color: bool,
 }
 
 impl Default for TerminalOptions {
@@ -25,6 +27,7 @@ impl Default for TerminalOptions {
             show_filename: true,
             column: false,
             null: false,
+            color: false,
         }
     }
 }

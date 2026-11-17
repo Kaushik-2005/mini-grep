@@ -1,18 +1,25 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ColorArg {
+    Auto,
+    Always,
+    Never,
+}
 
 #[derive(Debug, Parser)]
 #[command(
     name = "mini-grep",
     version,
     about = "Search UTF-8 files in a file or directory.",
-    override_usage = "mini-grep [OPTIONS] <PATTERN> <PATH>\n       mini-grep [OPTIONS] (-e <PATTERN> | -f <FILE>)... <PATH>",
+    override_usage = "mini-grep [OPTIONS] <PATTERN> [PATH]\n       mini-grep [OPTIONS] (-e <PATTERN> | -f <FILE>)... [PATH]\n       mini-grep --files [OPTIONS] [PATH]",
     disable_help_flag = true
 )]
 pub(crate) struct Args {
-    /// Pattern and path, or path only when -e/-f supplies patterns
+    /// Pattern and optional path, or optional path when -e/-f supplies patterns
     #[arg(value_name = "INPUT", num_args = 0..)]
     pub(crate) inputs: Vec<OsString>,
 
@@ -173,9 +180,47 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) column: bool,
 
+    /// Control match highlighting
+    #[arg(long, value_enum, default_value = "auto", value_name = "WHEN")]
+    pub(crate) color: ColorArg,
+
     /// Write a NUL byte after each emitted filename
     #[arg(short = '0', long, conflicts_with = "heading")]
     pub(crate) null: bool,
+
+    /// List discovered files without searching their contents
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "patterns",
+            "pattern_files",
+            "ignore_case",
+            "smart_case",
+            "fixed_strings",
+            "word_regexp",
+            "line_regexp",
+            "invert_match",
+            "after_context",
+            "before_context",
+            "context",
+            "max_count",
+            "max_results",
+            "files_with_matches",
+            "files_without_match",
+            "count",
+            "count_matches",
+            "only_matching",
+        ]
+    )]
+    pub(crate) files: bool,
+
+    /// Read target paths from a file or - for stdin; repeat for more lists
+    #[arg(long, value_name = "FILE")]
+    pub(crate) files_from: Vec<PathBuf>,
+
+    /// Search NUL-containing content as text; UTF-8 is still required
+    #[arg(long, conflicts_with = "files")]
+    pub(crate) text: bool,
 
     /// Print help
     #[arg(long, action = ArgAction::Help)]
@@ -300,5 +345,59 @@ mod tests {
         assert!(args.no_filename);
         assert!(!args.with_filename);
         assert_eq!(args.help, None);
+    }
+
+    #[test]
+    fn color_defaults_to_auto() {
+        let args = Args::try_parse_from(["mini-grep", "Rust", "sample.txt"])
+            .expect("default color settings must parse");
+
+        assert_eq!(args.color, ColorArg::Auto);
+    }
+
+    #[test]
+    fn accepts_each_color_choice() {
+        for (value, expected) in [
+            ("auto", ColorArg::Auto),
+            ("always", ColorArg::Always),
+            ("never", ColorArg::Never),
+        ] {
+            let args = Args::try_parse_from(["mini-grep", "--color", value, "Rust", "sample.txt"])
+                .expect("supported color choice must parse");
+
+            assert_eq!(args.color, expected);
+        }
+    }
+
+    #[test]
+    fn accepts_color_with_equals_syntax() {
+        let args = Args::try_parse_from(["mini-grep", "--color=always", "Rust", "sample.txt"])
+            .expect("equals syntax must parse");
+
+        assert_eq!(args.color, ColorArg::Always);
+    }
+
+    #[test]
+    fn rejects_invalid_color_choices() {
+        for value in ["sometimes", "ALWAYS", ""] {
+            let error = Args::try_parse_from(["mini-grep", "--color", value, "Rust", "sample.txt"])
+                .expect_err("unsupported color choice must fail");
+
+            assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        }
+    }
+
+    #[test]
+    fn color_requires_a_value() {
+        assert!(Args::try_parse_from(["mini-grep", "Rust", "sample.txt", "--color"]).is_err());
+    }
+
+    #[test]
+    fn enumeration_accepts_a_color_choice() {
+        let args = Args::try_parse_from(["mini-grep", "--files", "--color=always", "."])
+            .expect("enumeration must accept color settings");
+
+        assert!(args.files);
+        assert_eq!(args.color, ColorArg::Always);
     }
 }

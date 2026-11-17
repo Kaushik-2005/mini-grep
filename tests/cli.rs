@@ -141,7 +141,7 @@ fn empty_pattern_matches_blank_lines_without_an_extra_trailing_line() {
 
 #[test]
 fn invalid_argument_counts_return_two_and_usage() {
-    let cases: &[&[&str]] = &[&[], &["Rust"], &["Rust", "file.txt", "extra.txt"]];
+    let cases: &[&[&str]] = &[&[], &["Rust", "file.txt", "extra.txt"]];
 
     for args in cases {
         let output = command()
@@ -391,7 +391,7 @@ fn help_and_version_succeed_without_search_arguments() {
     for expected in [
         "Usage:",
         "<PATTERN>",
-        "<PATH>",
+        "[PATH]",
         "--ignore-case",
         "--fixed-strings",
         "--line-number",
@@ -462,7 +462,7 @@ fn empty_path_returns_a_usage_error() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.starts_with("error:"), "{stderr}");
-    assert!(stderr.contains("<PATH>"), "{stderr}");
+    assert!(stderr.contains("[PATH]"), "{stderr}");
 }
 
 #[test]
@@ -765,21 +765,15 @@ fn explicit_pattern_sources_reject_invalid_argument_combinations() {
         .output()
         .expect("executable must start");
 
-    let missing_path = command()
-        .args(["-e", "Rust"])
-        .output()
-        .expect("executable must start");
-
     let stdin_patterns = command()
-        .args(["-f", "-"])
-        .arg(&target.path)
+        .args(["-f", "-", "-"])
         .output()
         .expect("executable must start");
 
     let stderr = String::from_utf8_lossy(&stdin_patterns.stderr);
     assert!(stderr.contains("stdin"), "{stderr}");
 
-    for output in [extra_pattern, missing_path, stdin_patterns] {
+    for output in [extra_pattern, stdin_patterns] {
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
 
@@ -2325,5 +2319,541 @@ fn null_output_preserves_non_utf8_paths_with_embedded_newlines() {
         }
 
         assert_eq!(output.stdout, expected);
+    }
+}
+
+#[test]
+fn a_relative_dash_filename_is_not_treated_as_stdin() {
+    let mut fixture = Fixture::new(b"Rust\n");
+    let renamed = fixture.directory.join("-");
+
+    fs::rename(&fixture.path, &renamed).expect("fixture must be renamed");
+    fixture.path = renamed;
+
+    let target = Path::new(".").join("-");
+
+    let output = command()
+        .current_dir(&fixture.directory)
+        .arg("Rust")
+        .arg(&target)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let expected = format!("{}:Rust\n", target.display());
+    assert_eq!(output.stdout, expected.as_bytes());
+}
+
+#[test]
+fn combines_argument_file_and_stdin_pattern_sources() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let target = Fixture::new(b"Rust makes ownership explicit.\nGo\nPython\n");
+    let pattern_file = Path::new("tests")
+        .join("fixtures")
+        .join("text")
+        .join("demo.txt");
+
+    let mut child = command()
+        .args(["-n", "-e", "^Python$", "-f"])
+        .arg(&pattern_file)
+        .args(["-f", "-"])
+        .arg(&target.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("executable must start");
+
+    {
+        let mut input = child.stdin.take().expect("child stdin must be available");
+        input
+            .write_all(b"^Go$\n")
+            .expect("patterns must be written");
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("child output must be collected");
+
+    assert_selected_lines(
+        output,
+        &target.path,
+        &[
+            (1, "Rust makes ownership explicit."),
+            (2, "Go"),
+            (3, "Python"),
+        ],
+    );
+}
+
+#[test]
+fn a_relative_dash_pattern_file_is_not_treated_as_stdin() {
+    let mut patterns = Fixture::new(b"Rust\n");
+    let renamed = patterns.directory.join("-");
+
+    fs::rename(&patterns.path, &renamed).expect("pattern fixture must be renamed");
+    patterns.path = renamed;
+
+    let target = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("text")
+        .join("demo.txt");
+
+    let pattern_path = Path::new(".").join("-");
+
+    let output = command()
+        .current_dir(&patterns.directory)
+        .args(["-n", "-f"])
+        .arg(&pattern_path)
+        .arg(&target)
+        .output()
+        .expect("executable must start");
+
+    assert_selected_lines(
+        output,
+        &target,
+        &[
+            (2, "Rust makes ownership explicit."),
+            (4, "Rust rewards careful design."),
+        ],
+    );
+}
+
+#[test]
+fn file_enumeration_reports_a_missing_target() {
+    let fixture = Fixture::new(b"");
+    let missing = fixture.directory.join("missing-directory");
+
+    let output = command()
+        .arg("--files")
+        .arg(&missing)
+        .output()
+        .expect("executable must start");
+
+    assert_operational_error(&output, &missing);
+    assert!(output.stdout.is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot discover files"), "{stderr}");
+}
+
+#[test]
+fn path_list_source_errors_precede_all_target_output() {
+    let target = Fixture::new(b"Rust\n");
+    let contents = format!("{}\n", target.path.display());
+    let valid = Fixture::new(contents.as_bytes());
+    let invalid = Fixture::new(b"bad\0name\n");
+    let missing = invalid.directory.join("missing.paths");
+
+    let modes: &[&[&str]] = &[&["Rust"], &["Rust", "--max-results", "0"], &["--files"]];
+
+    for (bad_source, diagnostic) in [
+        (invalid.path.as_path(), "cannot read"),
+        (missing.as_path(), "cannot open"),
+    ] {
+        for flags in modes {
+            let output = command()
+                .args(*flags)
+                .arg("--files-from")
+                .arg(&valid.path)
+                .arg("--files-from")
+                .arg(bad_source)
+                .output()
+                .expect("executable must start");
+
+            assert_operational_error(&output, bad_source);
+            assert!(output.stdout.is_empty());
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(diagnostic), "{stderr}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn listed_unix_paths_preserve_non_utf8_bytes_through_null_output() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut target = Fixture::new(b"Rust\n");
+    let renamed = target
+        .directory
+        .join(std::ffi::OsStr::from_bytes(b"sample-\xff #.txt"));
+
+    fs::rename(&target.path, &renamed).expect("target fixture must be renamed");
+    target.path = renamed;
+
+    let mut contents = target.path.as_os_str().as_bytes().to_vec();
+    contents.push(b'\n');
+    let list = Fixture::new(&contents);
+
+    for enumerate in [false, true] {
+        let mut process = command();
+        process.arg("-0");
+
+        if enumerate {
+            process.arg("--files");
+        } else {
+            process.args(["-n", "Rust"]);
+        }
+
+        let output = process
+            .arg("--files-from")
+            .arg(&list.path)
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+
+        let mut expected = target.path.as_os_str().as_bytes().to_vec();
+        expected.push(0);
+
+        if !enumerate {
+            expected.extend_from_slice(b"1:Rust\n");
+        }
+
+        assert_eq!(output.stdout, expected);
+    }
+}
+
+#[test]
+fn redirected_color_defaults_to_plain_and_can_be_forced() {
+    let fixture = Fixture::new("é Rust!\n".as_bytes());
+
+    let plain_cases: &[&[&str]] = &[&[], &["--color=auto"], &["--color=never"]];
+
+    for flags in plain_cases {
+        let output = command()
+            .args(*flags)
+            .args(["-n", "Rust"])
+            .arg(&fixture.path)
+            .output()
+            .expect("executable must start");
+
+        assert_selected_lines(output, &fixture.path, &[(1, "é Rust!")]);
+    }
+
+    let output = command()
+        .args(["--color=always", "-n", "Rust"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_selected_lines(output, &fixture.path, &[(1, "é \x1b[1;31mRust\x1b[0m!")]);
+}
+
+#[test]
+fn forced_color_keeps_context_and_numeric_prefixes_plain() {
+    let fixture = Fixture::new("before\né Rust Rust\nafter\n".as_bytes());
+
+    let output = command()
+        .args(["--color=always", "-h", "--column", "-C", "1", "Rust"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.stderr.is_empty());
+
+    let expected = concat!(
+        "1-1-before\n",
+        "2:4:é \x1b[1;31mRust\x1b[0m \x1b[1;31mRust\x1b[0m\n",
+        "3-1-after\n",
+    );
+
+    assert_eq!(output.stdout, expected.as_bytes());
+}
+
+#[test]
+fn forced_match_only_color_preserves_original_byte_columns() {
+    let fixture = Fixture::new("é Rust Rust\n".as_bytes());
+
+    let output = command()
+        .args(["--color=always", "-h", "--column", "-o", "Rust"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.stderr.is_empty());
+
+    let expected = concat!("1:4:\x1b[1;31mRust\x1b[0m\n", "1:9:\x1b[1;31mRust\x1b[0m\n",);
+
+    assert_eq!(output.stdout, expected.as_bytes());
+}
+
+#[test]
+fn forced_color_merges_full_line_overlaps_but_keeps_match_only_records() {
+    let fixture = Fixture::new(b"abcd\n");
+
+    let output = command()
+        .args(["--color=always", "-n", "-e", "abc", "-e", "bcd"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_selected_lines(output, &fixture.path, &[(1, "\x1b[1;31mabcd\x1b[0m")]);
+
+    let output = command()
+        .args(["--color=always", "-no", "-e", "abc", "-e", "bcd"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_selected_lines(
+        output,
+        &fixture.path,
+        &[(1, "\x1b[1;31mabc\x1b[0m"), (1, "\x1b[1;31mbcd\x1b[0m")],
+    );
+}
+
+#[test]
+fn forced_color_does_not_render_zero_width_matches() {
+    let fixture = Fixture::new(b"Rust\nGo\n");
+
+    let output = command()
+        .args(["--color=always", "-n", "^"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_selected_lines(output, &fixture.path, &[(1, "Rust"), (2, "Go")]);
+
+    let output = command()
+        .args(["--color=always", "-o", "^"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn forced_color_leaves_non_match_output_plain() {
+    let fixture = Fixture::new(b"Rust Rust\nGo\n");
+    let path = fixture.path.display();
+
+    let cases = [
+        (vec!["-c", "Rust"], format!("{path}:1\n")),
+        (vec!["--count-matches", "Rust"], format!("{path}:2\n")),
+        (vec!["-l", "Rust"], format!("{path}\n")),
+        (vec!["--files-without-match", "absent"], format!("{path}\n")),
+        (vec!["--files"], format!("{path}\n")),
+        (vec!["-q", "Rust"], String::new()),
+        (vec!["-nv", "Rust"], format!("{path}:2:Go\n")),
+    ];
+
+    for (arguments, expected) in cases {
+        let output = command()
+            .arg("--color=always")
+            .args(&arguments)
+            .arg(&fixture.path)
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "arguments: {arguments:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            output.stdout,
+            expected.as_bytes(),
+            "arguments: {arguments:?}",
+        );
+    }
+}
+
+#[test]
+fn binary_detection_precedes_utf8_decoding() {
+    let fixture = Fixture::new(b"\xff\0Rust\n");
+
+    let output = command()
+        .arg("Rust")
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let output = command()
+        .args(["--text", "Rust"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_operational_error(&output, &fixture.path);
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn text_flag_preserves_nul_in_matching_utf8_content() {
+    let fixture = Fixture::new(b"Rust\0ok\n");
+
+    let output = command()
+        .args(["--text", "-n", "Rust"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_selected_lines(output, &fixture.path, &[(1, "Rust\0ok")]);
+}
+
+#[test]
+fn late_binary_detection_preserves_printed_matches_and_context() {
+    let fixture = Fixture::new(b"before\nRust\ncontext\nRu\0st\nRust\n");
+
+    let output = command()
+        .args(["-n", "-C", "1", "Rust"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let path = fixture.path.display();
+    let expected = format!(
+        "{path}-1-before\n\
+         {path}:2:Rust\n\
+         {path}-3-context\n"
+    );
+
+    assert_eq!(output.stdout, expected.as_bytes());
+}
+
+#[test]
+fn binary_stop_suppresses_incomplete_counts() {
+    let fixture = Fixture::new(b"Rust Rust\nGo\0\nRust\n");
+
+    for (mode, text_count) in [("-c", 2), ("--count-matches", 3)] {
+        let output = command()
+            .args([mode, "Rust"])
+            .arg(&fixture.path)
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "mode: {mode}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+
+        let output = command()
+            .args(["--text", mode, "Rust"])
+            .arg(&fixture.path)
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+
+        let expected = format!("{}:{text_count}\n", fixture.path.display());
+        assert_eq!(output.stdout, expected.as_bytes());
+    }
+}
+
+#[test]
+fn binary_stop_does_not_qualify_a_file_without_matches() {
+    let fixture = Fixture::new(b"Go\n\0Rust\n");
+
+    let output = command()
+        .args(["--files-without-match", "absent"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let output = command()
+        .args(["--text", "--files-without-match", "absent"])
+        .arg(&fixture.path)
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let expected = format!("{}\n", fixture.path.display());
+    assert_eq!(output.stdout, expected.as_bytes());
+}
+
+#[test]
+fn early_exits_leave_later_binary_and_invalid_bytes_unchecked() {
+    let fixture = Fixture::new(b"Rust\n\xff\0\n");
+    let path = fixture.path.display();
+
+    let cases = [
+        (vec!["-q"], 0, String::new()),
+        (vec!["-l"], 0, format!("{path}\n")),
+        (vec!["-n", "-m", "1"], 0, format!("{path}:1:Rust\n")),
+        (
+            vec!["-n", "--max-results", "1"],
+            0,
+            format!("{path}:1:Rust\n"),
+        ),
+        (vec!["-c", "-m", "1"], 0, format!("{path}:1\n")),
+        (vec!["--files-without-match"], 1, String::new()),
+        (vec!["--max-results", "0"], 1, String::new()),
+    ];
+
+    for (arguments, expected_code, expected_output) in cases {
+        let output = command()
+            .arg("--text")
+            .args(&arguments)
+            .arg("Rust")
+            .arg(&fixture.path)
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "arguments: {arguments:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            output.stdout,
+            expected_output.as_bytes(),
+            "arguments: {arguments:?}",
+        );
     }
 }

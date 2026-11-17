@@ -11,7 +11,10 @@ pub enum AppError {
     Open { path: PathBuf, source: io::Error },
     Read { path: PathBuf, source: io::Error },
     Output(io::Error),
+    Diagnostic(io::Error),
     Pattern(Box<::regex::Error>),
+    Cancelled,
+    Signal(ctrlc::Error),
 }
 
 impl fmt::Display for AppError {
@@ -31,9 +34,16 @@ impl fmt::Display for AppError {
             Self::Output(source) => {
                 write!(formatter, "cannot write output: {source}")
             }
+            Self::Diagnostic(source) => {
+                write!(formatter, "cannot write diagnostic: {source}")
+            }
             Self::Pattern(error) => {
                 write!(formatter, "invalid search pattern: {error}")
             }
+            Self::Signal(source) => {
+                write!(formatter, "cannot install Ctrl+C handler: {source}")
+            }
+            Self::Cancelled => write!(formatter, "operation cancelled"),
         }
     }
 }
@@ -41,13 +51,15 @@ impl fmt::Display for AppError {
 impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Usage(_) => None,
+            Self::Usage(_) | Self::Cancelled => None,
             Self::Cli(error) => Some(error.as_ref()),
             Self::Discovery(error) => Some(error.as_ref()),
-            Self::Open { source, .. } | Self::Read { source, .. } | Self::Output(source) => {
-                Some(source)
-            }
+            Self::Open { source, .. }
+            | Self::Read { source, .. }
+            | Self::Output(source)
+            | Self::Diagnostic(source) => Some(source),
             Self::Pattern(error) => Some(error.as_ref()),
+            Self::Signal(source) => Some(source),
         }
     }
 }
@@ -107,5 +119,35 @@ mod tests {
             .expect("source must retain its I/O error type");
 
         assert_eq!(source.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn diagnostic_error_preserves_its_source() {
+        let error = AppError::Diagnostic(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "diagnostic pipe closed",
+        ));
+
+        assert_eq!(
+            error.to_string(),
+            "cannot write diagnostic: diagnostic pipe closed"
+        );
+
+        let source = error
+            .source()
+            .expect("I/O source must exist")
+            .downcast_ref::<io::Error>()
+            .expect("source must retain its I/O error type");
+
+        assert_eq!(source.kind(), io::ErrorKind::BrokenPipe);
+        assert!(matches!(error, AppError::Diagnostic(_)));
+    }
+
+    #[test]
+    fn cancellation_has_a_message_without_an_underlying_source() {
+        let error = AppError::Cancelled;
+
+        assert_eq!(error.to_string(), "operation cancelled");
+        assert!(error.source().is_none());
     }
 }

@@ -1,22 +1,31 @@
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use super::args::Args;
+use super::args::{Args, ColorArg};
 use crate::AppError;
 use crate::discovery::DiscoveryOptions;
+use crate::input::binary::BinaryPolicy;
 use crate::output::OutputMode;
+use crate::output::color::ColorPolicy;
 use crate::search::{CaseMode, MatchScope, PatternMode, PatternOptions, Selection};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PatternSource {
     Argument(String),
     File(PathBuf),
+    Stdin,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PathListSource {
+    File(PathBuf),
+    Stdin,
 }
 
 #[derive(Debug)]
 pub(crate) struct SearchInputs {
     pub(crate) sources: Vec<PatternSource>,
-    pub(crate) path: PathBuf,
+    pub(crate) path: Option<PathBuf>,
 }
 
 pub(crate) fn resolve_inputs(
@@ -28,12 +37,15 @@ pub(crate) fn resolve_inputs(
         if path.as_os_str().is_empty() {
             return Err(AppError::Usage("pattern file path must not be empty"));
         }
+    }
 
-        if path == Path::new("-") {
-            return Err(AppError::Usage(
-                "reading patterns from stdin is not supported yet",
-            ));
-        }
+    let stdin_sources = pattern_files
+        .iter()
+        .filter(|path| path.as_os_str() == "-")
+        .count();
+
+    if stdin_sources > 1 {
+        return Err(AppError::Usage("stdin can supply patterns only once"));
     }
 
     let has_explicit_sources = !explicit_patterns.is_empty() || !pattern_files.is_empty();
@@ -41,7 +53,13 @@ pub(crate) fn resolve_inputs(
     let mut sources: Vec<_> = explicit_patterns
         .into_iter()
         .map(PatternSource::Argument)
-        .chain(pattern_files.into_iter().map(PatternSource::File))
+        .chain(pattern_files.into_iter().map(|path| {
+            if path.as_os_str() == "-" {
+                PatternSource::Stdin
+            } else {
+                PatternSource::File(path)
+            }
+        }))
         .collect();
 
     let mut positionals = positionals.into_iter();
@@ -50,7 +68,7 @@ pub(crate) fn resolve_inputs(
     let third = positionals.next();
 
     let path = match (has_explicit_sources, first, second, third) {
-        (false, Some(pattern), Some(path), None) => {
+        (false, Some(pattern), path, None) => {
             let pattern = pattern
                 .into_string()
                 .map_err(|_| AppError::Usage("pattern must be valid UTF-8"))?;
@@ -58,27 +76,96 @@ pub(crate) fn resolve_inputs(
             sources.push(PatternSource::Argument(pattern));
             path
         }
-        (true, Some(path), None, None) => path,
+        (true, path, None, None) => path,
         _ => {
             return Err(AppError::Usage(
-                "expected <PATTERN> <PATH>, or one <PATH> with -e/-f",
+                "expected <PATTERN> [PATH], or at most one [PATH] with -e/-f",
             ));
         }
     };
 
-    let path = PathBuf::from(path);
+    let path = path.map(PathBuf::from);
 
-    if path.as_os_str().is_empty() {
+    if path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
         return Err(AppError::Usage("file path must not be empty"));
+    }
+
+    if stdin_sources > 0 && path.as_ref().is_some_and(|path| path.as_os_str() == "-") {
+        return Err(AppError::Usage(
+            "stdin cannot supply both patterns and search input",
+        ));
     }
 
     Ok(SearchInputs { sources, path })
 }
 
+fn resolve_file_inputs(positionals: Vec<OsString>) -> Result<SearchInputs, AppError> {
+    let mut positionals = positionals.into_iter();
+    let first = positionals.next();
+
+    if positionals.next().is_some() {
+        return Err(AppError::Usage("--files accepts at most one target path"));
+    }
+
+    let path = first.map(PathBuf::from);
+
+    if let Some(path) = &path {
+        if path.as_os_str().is_empty() {
+            return Err(AppError::Usage("file path must not be empty"));
+        }
+
+        if path.as_os_str() == "-" {
+            return Err(AppError::Usage(
+                "--files requires a filename target, not stdin",
+            ));
+        }
+    }
+
+    Ok(SearchInputs {
+        sources: Vec::new(),
+        path,
+    })
+}
+
+fn resolve_path_lists(
+    files: Vec<PathBuf>,
+    pattern_sources: &[PatternSource],
+) -> Result<Vec<PathListSource>, AppError> {
+    let mut stdin_reserved = pattern_sources
+        .iter()
+        .any(|source| matches!(source, PatternSource::Stdin));
+
+    let mut sources = Vec::new();
+
+    for path in files {
+        if path.as_os_str().is_empty() {
+            return Err(AppError::Usage("path-list source must not be empty"));
+        }
+
+        if path.as_os_str() == "-" {
+            if stdin_reserved {
+                return Err(AppError::Usage(
+                    "stdin can supply only one pattern or path-list source",
+                ));
+            }
+
+            stdin_reserved = true;
+            sources.push(PathListSource::Stdin);
+        } else {
+            sources.push(PathListSource::File(path));
+        }
+    }
+
+    Ok(sources)
+}
+
 #[derive(Debug)]
 pub(crate) struct Config {
     pub(crate) sources: Vec<PatternSource>,
-    pub(crate) path: PathBuf,
+    pub(crate) path: Option<PathBuf>,
     pub(crate) pattern_options: PatternOptions,
     pub(crate) line_numbers: bool,
     pub(crate) discovery: DiscoveryOptions,
@@ -92,6 +179,10 @@ pub(crate) struct Config {
     pub(crate) column: bool,
     pub(crate) heading: bool,
     pub(crate) null: bool,
+    pub(crate) files: bool,
+    pub(crate) path_lists: Vec<PathListSource>,
+    pub(crate) color: ColorPolicy,
+    pub(crate) binary_policy: BinaryPolicy,
 }
 
 impl TryFrom<Args> for Config {
@@ -165,7 +256,51 @@ impl TryFrom<Args> for Config {
             OutputMode::Lines
         };
 
-        let inputs = resolve_inputs(args.inputs, args.patterns, args.pattern_files)?;
+        if args.files {
+            let has_search_options = [
+                !args.patterns.is_empty(),
+                !args.pattern_files.is_empty(),
+                args.ignore_case,
+                args.smart_case,
+                args.fixed_strings,
+                args.word_regexp,
+                args.line_regexp,
+                args.invert_match,
+                args.after_context.is_some(),
+                args.before_context.is_some(),
+                args.context.is_some(),
+                args.max_count.is_some(),
+                args.max_results.is_some(),
+                args.files_with_matches,
+                args.files_without_match,
+                args.count,
+                args.count_matches,
+                args.only_matching,
+                args.text,
+            ]
+            .into_iter()
+            .any(|enabled| enabled);
+
+            if has_search_options {
+                return Err(AppError::Usage(
+                    "--files cannot be combined with text-search options",
+                ));
+            }
+        }
+
+        let inputs = if args.files {
+            resolve_file_inputs(args.inputs)?
+        } else {
+            resolve_inputs(args.inputs, args.patterns, args.pattern_files)?
+        };
+
+        let path_lists = resolve_path_lists(args.files_from, &inputs.sources)?;
+
+        if !path_lists.is_empty() && inputs.path.is_some() {
+            return Err(AppError::Usage(
+                "--files-from cannot be combined with a positional target",
+            ));
+        }
 
         let case = if args.ignore_case {
             CaseMode::Insensitive
@@ -221,6 +356,18 @@ impl TryFrom<Args> for Config {
                 file_types: args.file_types,
                 excluded_types: args.excluded_types,
                 follow_links: args.follow,
+            },
+            files: args.files,
+            path_lists,
+            color: match args.color {
+                ColorArg::Auto => ColorPolicy::Auto,
+                ColorArg::Always => ColorPolicy::Always,
+                ColorArg::Never => ColorPolicy::Never,
+            },
+            binary_policy: if args.text {
+                BinaryPolicy::Text
+            } else {
+                BinaryPolicy::Skip
             },
         })
     }
@@ -311,11 +458,11 @@ mod tests {
             inputs.sources,
             vec![PatternSource::Argument(String::from("Rust"))]
         );
-        assert_eq!(inputs.path, PathBuf::from("sample.txt"));
+        assert_eq!(inputs.path, Some(PathBuf::from("sample.txt")));
     }
 
     #[test]
-    fn explicit_sources_require_only_a_path() {
+    fn explicit_sources_accept_one_target() {
         let inputs = resolve_inputs(
             positionals(&["sample.txt"]),
             vec![String::from("Rust"), String::from("Go")],
@@ -331,7 +478,7 @@ mod tests {
                 PatternSource::File(PathBuf::from("patterns.txt")),
             ]
         );
-        assert_eq!(inputs.path, PathBuf::from("sample.txt"));
+        assert_eq!(inputs.path, Some(PathBuf::from("sample.txt")));
     }
 
     #[test]
@@ -353,7 +500,7 @@ mod tests {
                 PatternSource::File(PathBuf::from("second.patterns")),
             ]
         );
-        assert_eq!(inputs.path, PathBuf::from("naïve file.txt"));
+        assert_eq!(inputs.path, Some(PathBuf::from("naïve file.txt")));
     }
 
     #[test]
@@ -368,9 +515,7 @@ mod tests {
     fn rejects_incorrect_positional_counts() {
         let cases: &[(&[&str], bool)] = &[
             (&[], false),
-            (&["Rust"], false),
             (&["Rust", "sample.txt", "extra.txt"], false),
-            (&[], true),
             (&["Rust", "sample.txt"], true),
         ];
 
@@ -389,21 +534,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_paths_and_unsupported_pattern_stdin() {
+    fn rejects_empty_search_and_pattern_file_paths() {
         assert!(resolve_inputs(positionals(&["Rust", ""]), vec![], vec![],).is_err());
 
         assert!(resolve_inputs(positionals(&[""]), vec![String::from("Rust")], vec![],).is_err());
 
-        for path in ["", "-"] {
-            assert!(
-                resolve_inputs(
-                    positionals(&["sample.txt"]),
-                    vec![],
-                    vec![PathBuf::from(path)],
-                )
-                .is_err()
-            );
-        }
+        assert!(
+            resolve_inputs(positionals(&["sample.txt"]), vec![], vec![PathBuf::new()],).is_err()
+        );
     }
 
     #[test]
@@ -836,5 +974,336 @@ mod tests {
 
             assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
+    }
+
+    #[test]
+    fn pattern_sources_allow_an_omitted_target() {
+        let positional = resolve_inputs(positionals(&["Rust"]), vec![], vec![])
+            .expect("a positional pattern can omit the target");
+
+        let explicit = resolve_inputs(vec![], vec![String::from("Rust")], vec![])
+            .expect("an explicit pattern can omit the target");
+
+        let pattern_file = resolve_inputs(vec![], vec![], vec![PathBuf::from("patterns.txt")])
+            .expect("a pattern file can omit the target");
+
+        for inputs in [positional, explicit, pattern_file] {
+            assert_eq!(inputs.path, None);
+            assert!(!inputs.sources.is_empty());
+        }
+    }
+
+    #[test]
+    fn stdin_patterns_allow_an_omitted_search_target() {
+        let inputs = resolve_inputs(vec![], vec![String::from("Go")], vec![PathBuf::from("-")])
+            .expect("stdin patterns can combine with explicit patterns");
+
+        assert_eq!(
+            inputs.sources,
+            vec![
+                PatternSource::Argument(String::from("Go")),
+                PatternSource::Stdin,
+            ]
+        );
+        assert_eq!(inputs.path, None);
+    }
+
+    #[test]
+    fn rejects_multiple_consumers_of_stdin() {
+        assert!(
+            resolve_inputs(
+                positionals(&["sample.txt"]),
+                vec![],
+                vec![PathBuf::from("-"), PathBuf::from("-")],
+            )
+            .is_err()
+        );
+
+        assert!(resolve_inputs(positionals(&["-"]), vec![], vec![PathBuf::from("-")],).is_err());
+    }
+
+    #[test]
+    fn file_enumeration_can_omit_its_target_without_patterns() {
+        let inputs = resolve_file_inputs(vec![]).expect("enumeration can omit its target");
+
+        assert!(inputs.sources.is_empty());
+        assert_eq!(inputs.path, None);
+    }
+
+    #[test]
+    fn file_enumeration_preserves_one_explicit_filesystem_target() {
+        for name in ["sample.txt", "folder", "./-"] {
+            let inputs = resolve_file_inputs(positionals(&[name]))
+                .expect("one filesystem target must validate");
+
+            assert!(inputs.sources.is_empty());
+
+            let path = inputs.path.expect("the explicit target must be retained");
+
+            assert_eq!(path.as_os_str(), OsString::from(name).as_os_str());
+        }
+    }
+
+    #[test]
+    fn file_enumeration_rejects_invalid_targets() {
+        for values in [vec![""], vec!["-"], vec!["first", "second"]] {
+            let error = resolve_file_inputs(positionals(&values))
+                .expect_err("invalid enumeration targets must fail");
+
+            assert!(matches!(error, AppError::Usage(_)));
+        }
+    }
+
+    #[test]
+    fn file_enumeration_validates_without_pattern_sources() {
+        let cases: &[&[&str]] = &[
+            &["--files"],
+            &["--files", "folder"],
+            &["--files", "--hidden", "--no-ignore", "-0", "-q"],
+            &["--files", "--column", "--heading"],
+            &["--files", "-h", "-0"],
+        ];
+
+        for flags in cases {
+            let mut arguments = vec!["mini-grep"];
+            arguments.extend_from_slice(flags);
+
+            let args = Args::try_parse_from(arguments)
+                .expect("compatible enumeration arguments must parse");
+            let config =
+                Config::try_from(args).expect("enumeration must validate without patterns");
+
+            assert!(config.files);
+            assert!(config.sources.is_empty());
+        }
+    }
+
+    #[test]
+    fn file_enumeration_rejects_text_search_options() {
+        let cases: &[&[&str]] = &[
+            &["-e", "Rust"],
+            &["-f", "patterns.txt"],
+            &["-i"],
+            &["-S"],
+            &["-F"],
+            &["-w"],
+            &["-x"],
+            &["-v"],
+            &["-A", "1"],
+            &["-B", "1"],
+            &["-C", "1"],
+            &["-m", "1"],
+            &["--max-results", "1"],
+            &["-l"],
+            &["--files-without-match"],
+            &["-c"],
+            &["--count-matches"],
+            &["-o"],
+        ];
+
+        for flags in cases {
+            let mut arguments = vec!["mini-grep", "--files"];
+            arguments.extend_from_slice(flags);
+            arguments.push("folder");
+
+            let error = Args::try_parse_from(arguments)
+                .expect_err("enumeration must reject search options");
+
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "flags: {flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_list_sources_preserve_order_and_repeated_files() {
+        let sources = resolve_path_lists(
+            vec![
+                PathBuf::from("first.paths"),
+                PathBuf::from("-"),
+                PathBuf::from("second.paths"),
+                PathBuf::from("first.paths"),
+                PathBuf::from("./-"),
+            ],
+            &[],
+        )
+        .expect("distinct input sources must validate");
+
+        assert_eq!(
+            sources,
+            vec![
+                PathListSource::File(PathBuf::from("first.paths")),
+                PathListSource::Stdin,
+                PathListSource::File(PathBuf::from("second.paths")),
+                PathListSource::File(PathBuf::from("first.paths")),
+                PathListSource::File(PathBuf::from("./-")),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_lists_reject_multiple_reservations_of_stdin() {
+        assert!(resolve_path_lists(vec![PathBuf::from("-"), PathBuf::from("-")], &[],).is_err());
+
+        assert!(resolve_path_lists(vec![PathBuf::from("-")], &[PatternSource::Stdin],).is_err());
+    }
+
+    #[test]
+    fn ordinary_path_lists_can_combine_with_stdin_patterns() {
+        let sources = resolve_path_lists(
+            vec![PathBuf::from("targets.paths")],
+            &[PatternSource::Stdin],
+        )
+        .expect("only the pattern source reserves stdin");
+
+        assert_eq!(
+            sources,
+            vec![PathListSource::File(PathBuf::from("targets.paths")),]
+        );
+    }
+
+    #[test]
+    fn path_list_sources_reject_empty_names_and_allow_no_sources() {
+        assert!(resolve_path_lists(vec![PathBuf::new()], &[]).is_err());
+
+        assert!(
+            resolve_path_lists(vec![], &[])
+                .expect("no path lists is valid")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn path_lists_support_search_and_enumeration_without_a_target() {
+        let cases: &[(&[&str], bool, usize)] = &[
+            (&["Rust", "--files-from", "targets.paths"], false, 1),
+            (&["-e", "Rust", "--files-from", "targets.paths"], false, 1),
+            (&["--files", "--files-from", "targets.paths"], true, 0),
+        ];
+
+        for &(flags, files, pattern_count) in cases {
+            let mut arguments = vec!["mini-grep"];
+            arguments.extend_from_slice(flags);
+
+            let args = Args::try_parse_from(arguments).expect("path-list arguments must parse");
+            let config =
+                Config::try_from(args).expect("compatible path-list arguments must validate");
+
+            assert_eq!(config.files, files);
+            assert_eq!(config.sources.len(), pattern_count);
+            assert_eq!(config.path, None);
+            assert_eq!(
+                config.path_lists,
+                vec![PathListSource::File(PathBuf::from("targets.paths")),]
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_path_list_flags_preserve_source_order() {
+        let args = Args::try_parse_from([
+            "mini-grep",
+            "Rust",
+            "--files-from",
+            "first.paths",
+            "--files-from",
+            "-",
+            "--files-from",
+            "second.paths",
+        ])
+        .expect("repeated list flags must parse");
+
+        let config = Config::try_from(args).expect("one stdin source must validate");
+
+        assert_eq!(
+            config.path_lists,
+            vec![
+                PathListSource::File(PathBuf::from("first.paths")),
+                PathListSource::Stdin,
+                PathListSource::File(PathBuf::from("second.paths")),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_lists_reject_extra_targets_and_shared_stdin() {
+        let cases: &[&[&str]] = &[
+            &["Rust", "extra", "--files-from", "targets.paths"],
+            &["-e", "Rust", "extra", "--files-from", "targets.paths"],
+            &["--files", "extra", "--files-from", "targets.paths"],
+            &["Rust", "--files-from", "-", "--files-from", "-"],
+            &["-f", "-", "--files-from", "-"],
+            &["--files-from", "targets.paths"],
+        ];
+
+        for flags in cases {
+            let mut arguments = vec!["mini-grep"];
+            arguments.extend_from_slice(flags);
+
+            let args = Args::try_parse_from(arguments)
+                .expect("raw arguments must reach configuration validation");
+
+            let error =
+                Config::try_from(args).expect_err("invalid path-list combinations must fail");
+
+            assert!(matches!(error, AppError::Usage(_)), "flags: {flags:?}");
+        }
+    }
+
+    #[test]
+    fn default_color_policy_is_auto() {
+        let args = Args::try_parse_from(["mini-grep", "Rust", "sample.txt"])
+            .expect("default arguments must parse");
+        let config = Config::try_from(args).expect("default arguments must produce configuration");
+
+        assert_eq!(config.color, ColorPolicy::Auto);
+    }
+
+    #[test]
+    fn preserves_explicit_color_policy() {
+        for (value, expected) in [
+            ("auto", ColorPolicy::Auto),
+            ("always", ColorPolicy::Always),
+            ("never", ColorPolicy::Never),
+        ] {
+            let args = Args::try_parse_from(["mini-grep", "--color", value, "Rust", "sample.txt"])
+                .expect("color arguments must parse");
+
+            let config =
+                Config::try_from(args).expect("color arguments must produce configuration");
+
+            assert_eq!(config.color, expected);
+        }
+    }
+
+    #[test]
+    fn selects_binary_policy_from_text_flag() {
+        for (flags, expected) in [
+            (vec![], BinaryPolicy::Skip),
+            (vec!["--text"], BinaryPolicy::Text),
+        ] {
+            let args = Args::try_parse_from(
+                ["mini-grep"]
+                    .into_iter()
+                    .chain(flags)
+                    .chain(["Rust", "sample.txt"]),
+            )
+            .expect("search arguments must parse");
+
+            let config = Config::try_from(args).expect("search configuration must validate");
+
+            assert_eq!(config.binary_policy, expected);
+        }
+    }
+
+    #[test]
+    fn enumeration_rejects_text_policy() {
+        let mut args = Args::try_parse_from(["mini-grep", "--files", "."])
+            .expect("enumeration arguments must parse");
+        args.text = true;
+
+        assert!(matches!(Config::try_from(args), Err(AppError::Usage(_))));
     }
 }

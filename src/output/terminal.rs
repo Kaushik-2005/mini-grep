@@ -1,9 +1,9 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use super::TerminalOptions;
+use super::{TerminalOptions, color};
 use crate::AppError;
-use crate::search::{LineMatch, SearchEvent};
+use crate::search::{LineMatch, MatchSpan, SearchEvent};
 
 pub(crate) fn write_match(
     writer: &mut impl Write,
@@ -21,7 +21,7 @@ pub(crate) fn write_match(
         path,
         matched_line.line_number,
         column,
-        matched_line.text,
+        (matched_line.text, &matched_line.spans),
         ':',
         options,
     )
@@ -51,7 +51,7 @@ pub(crate) fn write_event(
                 path,
                 line.line_number,
                 column,
-                &line.text,
+                (&line.text, if line.selected { &line.spans } else { &[] }),
                 if line.selected { ':' } else { '-' },
                 options,
             )
@@ -98,12 +98,20 @@ pub(crate) fn write_only_matching(
             continue;
         }
 
+        let highlighted_span = MatchSpan::new(matched, 0, matched.len()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "matched text must form a valid complete span",
+            )
+        })?;
+        let highlighted_spans = [highlighted_span];
+
         write_line(
             writer,
             path,
             line.line_number,
             span.start() + 1,
-            matched,
+            (matched, &highlighted_spans),
             ':',
             options,
         )?;
@@ -117,10 +125,12 @@ fn write_line(
     path: &Path,
     line_number: usize,
     column: usize,
-    text: &str,
+    content: (&str, &[MatchSpan]),
     separator: char,
     options: TerminalOptions,
 ) -> io::Result<()> {
+    let (text, spans) = content;
+
     if options.show_filename {
         write_filename(writer, path, options.null, separator as u8)?;
     }
@@ -133,7 +143,13 @@ fn write_line(
         write!(writer, "{column}{separator}")?;
     }
 
-    writeln!(writer, "{text}")
+    if options.color {
+        color::write_highlighted(writer, text, spans)?;
+    } else {
+        writer.write_all(text.as_bytes())?;
+    }
+
+    writeln!(writer)
 }
 
 #[derive(Debug, Default)]
@@ -600,6 +616,7 @@ mod tests {
                 show_filename,
                 column: false,
                 null: false,
+                color: false,
             };
             let mut output = Vec::new();
 
@@ -608,7 +625,7 @@ mod tests {
                 Path::new("sample.txt"),
                 7,
                 1,
-                "é Rust",
+                ("é Rust", &[]),
                 separator,
                 options,
             )?;
@@ -728,5 +745,30 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn highlights_match_text_without_coloring_prefixes() -> io::Result<()> {
+        let text = "é Rust!";
+        let matched_line = LineMatch {
+            line_number: 7,
+            text,
+            spans: vec![MatchSpan::new(text, 3, 7).expect("span must cover Rust")],
+        };
+        let options = TerminalOptions {
+            line_numbers: true,
+            column: true,
+            color: true,
+            ..TerminalOptions::default()
+        };
+        let mut output = Vec::new();
+
+        write_match(&mut output, Path::new("sample.txt"), &matched_line, options)?;
+
+        assert_eq!(
+            output,
+            "sample.txt:7:4:é \x1b[1;31mRust\x1b[0m!\n".as_bytes(),
+        );
+        Ok(())
     }
 }

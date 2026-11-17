@@ -8,6 +8,14 @@ pub(crate) fn files(
     root: &Path,
     options: &DiscoveryOptions,
 ) -> Result<impl Iterator<Item = Result<PathBuf, ignore::Error>>, ignore::Error> {
+    let literal_dash = root == Path::new("-");
+    let walk_root = if literal_dash {
+        Path::new(".").join(root)
+    } else {
+        root.to_path_buf()
+    };
+    let root = walk_root.as_path();
+
     if !options.follow_links
         && std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
@@ -82,7 +90,20 @@ pub(crate) fn files(
                 }
 
                 match super::filters::within_size_limit(&entry, options.max_filesize) {
-                    Ok(true) => pending.push_back(Ok(entry.into_path())),
+                    Ok(true) => {
+                        let path = entry.into_path();
+
+                        let path = if literal_dash {
+                            match path.strip_prefix(".") {
+                                Ok(relative) => relative.to_path_buf(),
+                                Err(_) => path,
+                            }
+                        } else {
+                            path
+                        };
+
+                        pending.push_back(Ok(path));
+                    }
                     Ok(false) => {}
                     Err(error) => pending.push_back(Err(error)),
                 }

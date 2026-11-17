@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod discovery;
 mod error;
+mod execution;
 mod input;
 mod output;
 
