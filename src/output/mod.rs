@@ -1,16 +1,6 @@
 pub(crate) mod color;
 pub(crate) mod terminal;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutputMode {
-    Lines,
-    FilesWithMatches,
-    FilesWithoutMatch,
-    CountLines,
-    CountMatches,
-    OnlyMatching,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TerminalOptions {
     pub(crate) line_numbers: bool,

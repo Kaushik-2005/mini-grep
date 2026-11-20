@@ -3,6 +3,7 @@ use std::path::Path;
 
 use super::{TerminalOptions, color};
 use crate::AppError;
+use crate::execution::ExecutionEvent;
 use crate::search::{LineMatch, MatchSpan, SearchEvent};
 
 pub(crate) fn write_match(
@@ -211,6 +212,58 @@ fn write_filename(
     } else {
         write!(writer, "{}", path.display())?;
         writer.write_all(&[delimiter])
+    }
+}
+
+pub(crate) fn write_execution_event(
+    writer: &mut impl Write,
+    path: &Path,
+    event: ExecutionEvent,
+    options: TerminalOptions,
+    heading: bool,
+    headings: &mut HeadingState,
+) -> io::Result<()> {
+    let visible_line = match &event {
+        ExecutionEvent::Search(SearchEvent::Line(_)) => true,
+        ExecutionEvent::OnlyMatching(line) => line.spans.iter().any(|span| !span.is_empty()),
+        _ => false,
+    };
+
+    if heading && visible_line {
+        headings.before_record(writer, path)?;
+    }
+
+    let line_options = TerminalOptions {
+        show_filename: options.show_filename && !heading,
+        ..options
+    };
+
+    match event {
+        ExecutionEvent::BeginFile => {
+            headings.begin_file();
+            Ok(())
+        }
+        ExecutionEvent::Path => write_path(writer, path, options),
+        ExecutionEvent::Count(count) => write_count(writer, path, count, options),
+        ExecutionEvent::Search(SearchEvent::Line(line)) if line.selected => {
+            let matched = LineMatch {
+                line_number: line.line_number,
+                text: &line.text,
+                spans: line.spans,
+            };
+
+            write_match(writer, path, &matched, line_options)
+        }
+        ExecutionEvent::Search(event) => write_event(writer, path, &event, line_options),
+        ExecutionEvent::OnlyMatching(line) => {
+            let matched = LineMatch {
+                line_number: line.line_number,
+                text: &line.text,
+                spans: line.spans,
+            };
+
+            write_only_matching(writer, path, &matched, line_options)
+        }
     }
 }
 

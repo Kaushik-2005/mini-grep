@@ -1,11 +1,13 @@
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use super::args::{Args, ColorArg};
+use super::args::{Args, ColorArg, SortArg};
 use crate::AppError;
 use crate::discovery::DiscoveryOptions;
+use crate::execution::OutputMode;
+use crate::execution::ordering::SortOrder;
 use crate::input::binary::BinaryPolicy;
-use crate::output::OutputMode;
 use crate::output::color::ColorPolicy;
 use crate::search::{CaseMode, MatchScope, PatternMode, PatternOptions, Selection};
 
@@ -183,6 +185,8 @@ pub(crate) struct Config {
     pub(crate) path_lists: Vec<PathListSource>,
     pub(crate) color: ColorPolicy,
     pub(crate) binary_policy: BinaryPolicy,
+    pub(crate) threads: NonZeroUsize,
+    pub(crate) sort: SortOrder,
 }
 
 impl TryFrom<Args> for Config {
@@ -368,6 +372,11 @@ impl TryFrom<Args> for Config {
                 BinaryPolicy::Text
             } else {
                 BinaryPolicy::Skip
+            },
+            threads: args.threads,
+            sort: match args.sort {
+                SortArg::None => SortOrder::None,
+                SortArg::Path => SortOrder::Path,
             },
         })
     }

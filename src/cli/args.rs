@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, ValueEnum};
@@ -8,6 +9,12 @@ pub(crate) enum ColorArg {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SortArg {
+    None,
+    Path,
 }
 
 #[derive(Debug, Parser)]
@@ -183,6 +190,14 @@ pub(crate) struct Args {
     /// Control match highlighting
     #[arg(long, value_enum, default_value = "auto", value_name = "WHEN")]
     pub(crate) color: ColorArg,
+
+    /// Number of search workers
+    #[arg(short = 'j', long, default_value = "1", value_name = "NUM")]
+    pub(crate) threads: NonZeroUsize,
+
+    /// Control candidate path ordering
+    #[arg(long, value_enum, default_value = "none", value_name = "ORDER")]
+    pub(crate) sort: SortArg,
 
     /// Write a NUL byte after each emitted filename
     #[arg(short = '0', long, conflicts_with = "heading")]
@@ -399,5 +414,103 @@ mod tests {
 
         assert!(args.files);
         assert_eq!(args.color, ColorArg::Always);
+    }
+
+    #[test]
+    fn worker_count_defaults_to_one() {
+        let args = Args::try_parse_from(["mini-grep", "Rust", "sample.txt"])
+            .expect("default arguments must parse");
+
+        assert_eq!(args.threads.get(), 1);
+    }
+
+    #[test]
+    fn accepts_short_and_long_worker_counts() {
+        let cases: &[(&[&str], usize)] = &[
+            (&["-j", "2"], 2),
+            (&["-j4"], 4),
+            (&["--threads", "3"], 3),
+            (&["--threads=5"], 5),
+        ];
+
+        for &(flags, expected) in cases {
+            let args = Args::try_parse_from(
+                ["mini-grep"]
+                    .into_iter()
+                    .chain(flags.iter().copied())
+                    .chain(["Rust", "sample.txt"]),
+            )
+            .expect("positive worker count must parse");
+
+            assert_eq!(args.threads.get(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_worker_counts() {
+        for value in ["0", "-1", "abc", "", "184467440737095516160"] {
+            let flag = format!("--threads={value}");
+
+            let error = Args::try_parse_from(["mini-grep", flag.as_str(), "Rust", "sample.txt"])
+                .expect_err("invalid worker count must fail");
+
+            assert_eq!(error.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn worker_count_requires_a_value() {
+        assert!(Args::try_parse_from(["mini-grep", "Rust", "sample.txt", "-j"]).is_err());
+    }
+
+    #[test]
+    fn sorting_defaults_to_none() {
+        let args = Args::try_parse_from(["mini-grep", "Rust", "sample.txt"])
+            .expect("default arguments must parse");
+
+        assert_eq!(args.sort, SortArg::None);
+    }
+
+    #[test]
+    fn accepts_supported_sort_orders() {
+        for (value, expected) in [("none", SortArg::None), ("path", SortArg::Path)] {
+            let args = Args::try_parse_from(["mini-grep", "--sort", value, "Rust", "sample.txt"])
+                .expect("supported sort order must parse");
+
+            assert_eq!(args.sort, expected);
+        }
+    }
+
+    #[test]
+    fn accepts_sorting_with_workers_and_equals_syntax() {
+        let args = Args::try_parse_from(["mini-grep", "-j2", "--sort=path", "Rust", "sample.txt"])
+            .expect("sorting and worker settings must parse");
+
+        assert_eq!(args.sort, SortArg::Path);
+        assert_eq!(args.threads.get(), 2);
+    }
+
+    #[test]
+    fn rejects_invalid_sort_orders() {
+        for value in ["reverse", "PATH", ""] {
+            let error = Args::try_parse_from(["mini-grep", "--sort", value, "Rust", "sample.txt"])
+                .expect_err("unsupported sort order must fail");
+
+            assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        }
+    }
+
+    #[test]
+    fn sorting_requires_a_value() {
+        assert!(Args::try_parse_from(["mini-grep", "Rust", "sample.txt", "--sort"]).is_err());
+    }
+
+    #[test]
+    fn enumeration_accepts_path_sorting() {
+        let args = Args::try_parse_from(["mini-grep", "--files", "--sort=path", "."])
+            .expect("enumeration must accept sorting");
+
+        assert!(args.files);
+        assert_eq!(args.sort, SortArg::Path);
     }
 }

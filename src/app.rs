@@ -6,14 +6,13 @@ use crate::AppError;
 use crate::cli::{self, PathListSource, PatternSource};
 use crate::discovery::{DiscoveryOptions, walker};
 use crate::execution::cancel::CancellationToken;
-use crate::input::binary::BinaryPolicy;
+use crate::execution::{OutputMode, SearchOptions, ordering, parallel, sequential};
 use crate::input::paths as path_input;
 use crate::input::patterns as pattern_input;
 use crate::input::reader;
 use crate::input::stdin;
-use crate::output::{OutputMode, TerminalOptions, color, terminal};
-use crate::search::context::ContextSelector;
-use crate::search::{LineMatch, PatternMatcher, SearchLine};
+use crate::output::{TerminalOptions, color, terminal};
+use crate::search::PatternMatcher;
 
 #[derive(Debug)]
 pub enum SearchOutcome {
@@ -24,15 +23,9 @@ pub enum SearchOutcome {
 
 #[derive(Debug, Clone, Copy)]
 struct FileSearchOptions<'a> {
+    search: SearchOptions<'a>,
     terminal: TerminalOptions,
-    before_context: usize,
-    after_context: usize,
-    max_count: Option<usize>,
-    quiet: bool,
-    output_mode: OutputMode,
     heading: bool,
-    cancellation: &'a CancellationToken,
-    binary_policy: BinaryPolicy,
 }
 
 pub fn run() -> Result<SearchOutcome, AppError> {
@@ -52,6 +45,7 @@ pub fn run() -> Result<SearchOutcome, AppError> {
         return list_files(
             &roots,
             &config.discovery,
+            config.sort,
             TerminalOptions {
                 null: config.null,
                 ..TerminalOptions::default()
@@ -79,6 +73,15 @@ pub fn run() -> Result<SearchOutcome, AppError> {
     };
 
     let options = FileSearchOptions {
+        search: SearchOptions {
+            before_context: config.before_context,
+            after_context: config.after_context,
+            max_count: config.max_count,
+            quiet: config.quiet,
+            output_mode: config.output_mode,
+            cancellation: &cancellation,
+            binary_policy: config.binary_policy,
+        },
         terminal: TerminalOptions {
             line_numbers: config.line_numbers,
             show_filename: config.show_filename,
@@ -86,14 +89,7 @@ pub fn run() -> Result<SearchOutcome, AppError> {
             null: config.null,
             color: config.color.enabled(io::stdout().is_terminal()),
         },
-        before_context: config.before_context,
-        after_context: config.after_context,
-        max_count: config.max_count,
-        quiet: config.quiet,
-        output_mode: config.output_mode,
         heading: config.heading,
-        cancellation: &cancellation,
-        binary_policy: config.binary_policy,
     };
     let mut remaining_results = config.max_results;
 
@@ -126,6 +122,23 @@ pub fn run() -> Result<SearchOutcome, AppError> {
 
     let mut headings = terminal::HeadingState::default();
 
+    let candidates: Box<dyn Iterator<Item = Result<PathBuf, AppError>> + '_> = if use_stdin {
+        Box::new(std::iter::empty())
+    } else {
+        let mut report = |error: AppError| {
+            terminal::write_diagnostic(&mut diagnostics, &error).map_err(AppError::Diagnostic)?;
+            had_errors = true;
+            Ok(())
+        };
+
+        ordering::prepare(
+            discover_candidates(&roots, &config.discovery),
+            config.sort,
+            &cancellation,
+            &mut report,
+        )?
+    };
+
     if use_stdin {
         let result = search_reader(
             stdin::lock(),
@@ -155,49 +168,34 @@ pub fn run() -> Result<SearchOutcome, AppError> {
                 had_errors = true;
             }
         }
-    } else {
-        'roots: for root in roots {
-            cancellation.check()?;
+    } else if config.threads.get() > 1 && !config.quiet && remaining_results.is_none() {
+        let heading_enabled = options.heading
+            && matches!(
+                options.search.output_mode,
+                OutputMode::Lines | OutputMode::OnlyMatching
+            );
 
-            let candidates = match walker::files(&root, &config.discovery) {
-                Ok(candidates) => candidates,
-                Err(error) => {
-                    let error = AppError::Discovery(Box::new(error));
-
-                    terminal::write_diagnostic(&mut diagnostics, &error)
-                        .map_err(AppError::Diagnostic)?;
-                    had_errors = true;
-                    continue;
-                }
-            };
-
-            for candidate in candidates {
-                cancellation.check()?;
-
-                let result = candidate
-                    .map_err(|error| AppError::Discovery(Box::new(error)))
-                    .and_then(|path| {
-                        search_file(
-                            &path,
-                            &matcher,
-                            options,
-                            &mut remaining_results,
-                            &mut headings,
+        let result = {
+            let mut handle = |event: parallel::ParallelEvent<'_>| {
+                match event {
+                    parallel::ParallelEvent::Output { path, event } => {
+                        terminal::write_execution_event(
                             &mut writer,
+                            path,
+                            event,
+                            options.terminal,
+                            heading_enabled,
+                            &mut headings,
                         )
-                    });
-
-                match result {
-                    Ok(selected) => {
+                        .map_err(AppError::Output)?;
+                    }
+                    parallel::ParallelEvent::Finished(Ok(selected)) => {
                         found_result |= selected;
                     }
-                    Err(error) => {
+                    parallel::ParallelEvent::Finished(Err(error))
+                    | parallel::ParallelEvent::DiscoveryError(error) => {
                         if matches!(&error, AppError::Cancelled) {
                             return Err(error);
-                        }
-
-                        if let AppError::Output(source) = error {
-                            return finish_output_error(source, had_errors, &mut diagnostics);
                         }
 
                         terminal::write_diagnostic(&mut diagnostics, &error)
@@ -206,9 +204,69 @@ pub fn run() -> Result<SearchOutcome, AppError> {
                     }
                 }
 
-                if remaining_results == Some(0) || (config.quiet && found_result) {
-                    break 'roots;
+                Ok(())
+            };
+
+            parallel::run(
+                candidates,
+                &matcher,
+                options.search,
+                config.threads,
+                &mut handle,
+            )
+        };
+
+        if let Err(error) = result {
+            if let AppError::Output(source) = error {
+                return finish_output_error(source, had_errors, &mut diagnostics);
+            }
+
+            return Err(error);
+        }
+    } else {
+        let mut candidates = candidates;
+
+        loop {
+            cancellation.check()?;
+
+            let Some(candidate) = candidates.next() else {
+                break;
+            };
+
+            cancellation.check()?;
+
+            let result = candidate.and_then(|path| {
+                search_file(
+                    &path,
+                    &matcher,
+                    options,
+                    &mut remaining_results,
+                    &mut headings,
+                    &mut writer,
+                )
+            });
+
+            match result {
+                Ok(selected) => {
+                    found_result |= selected;
                 }
+                Err(error) => {
+                    if matches!(&error, AppError::Cancelled) {
+                        return Err(error);
+                    }
+
+                    if let AppError::Output(source) = error {
+                        return finish_output_error(source, had_errors, &mut diagnostics);
+                    }
+
+                    terminal::write_diagnostic(&mut diagnostics, &error)
+                        .map_err(AppError::Diagnostic)?;
+                    had_errors = true;
+                }
+            }
+
+            if remaining_results == Some(0) || (config.quiet && found_result) {
+                break;
             }
         }
     }
@@ -229,6 +287,24 @@ pub fn run() -> Result<SearchOutcome, AppError> {
     } else {
         Ok(SearchOutcome::NoSelection)
     }
+}
+
+fn discover_candidates<'a>(
+    roots: &'a [PathBuf],
+    options: &'a DiscoveryOptions,
+) -> impl Iterator<Item = Result<PathBuf, AppError>> + 'a {
+    roots.iter().flat_map(move |root| {
+        let candidates: Box<dyn Iterator<Item = Result<PathBuf, AppError>> + 'a> =
+            match walker::files(root, options) {
+                Ok(candidates) => Box::new(
+                    candidates
+                        .map(|result| result.map_err(|error| AppError::Discovery(Box::new(error)))),
+                ),
+                Err(error) => Box::new(std::iter::once(Err(AppError::Discovery(Box::new(error))))),
+            };
+
+        candidates
+    })
 }
 
 fn finish_output_error(
@@ -252,6 +328,7 @@ fn finish_output_error(
 fn list_files(
     roots: &[PathBuf],
     discovery: &DiscoveryOptions,
+    order: ordering::SortOrder,
     options: TerminalOptions,
     quiet: bool,
     cancellation: &CancellationToken,
@@ -264,43 +341,46 @@ fn list_files(
     let mut found_file = false;
     let mut had_errors = false;
 
-    'roots: for root in roots {
+    let mut candidates = {
+        let mut report = |error: AppError| {
+            terminal::write_diagnostic(&mut diagnostics, &error).map_err(AppError::Diagnostic)?;
+            had_errors = true;
+            Ok(())
+        };
+
+        ordering::prepare(
+            discover_candidates(roots, discovery),
+            order,
+            cancellation,
+            &mut report,
+        )?
+    };
+
+    loop {
         cancellation.check()?;
 
-        let candidates = match walker::files(root, discovery) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                let error = AppError::Discovery(Box::new(error));
+        let Some(candidate) = candidates.next() else {
+            break;
+        };
 
+        cancellation.check()?;
+
+        match candidate {
+            Ok(path) => {
+                found_file = true;
+
+                if quiet {
+                    break;
+                }
+
+                if let Err(source) = terminal::write_path(&mut writer, &path, options) {
+                    return finish_output_error(source, had_errors, &mut diagnostics);
+                }
+            }
+            Err(error) => {
                 terminal::write_diagnostic(&mut diagnostics, &error)
                     .map_err(AppError::Diagnostic)?;
                 had_errors = true;
-                continue;
-            }
-        };
-
-        for candidate in candidates {
-            cancellation.check()?;
-
-            match candidate {
-                Ok(path) => {
-                    found_file = true;
-
-                    if quiet {
-                        break 'roots;
-                    }
-
-                    if let Err(source) = terminal::write_path(&mut writer, &path, options) {
-                        return finish_output_error(source, had_errors, &mut diagnostics);
-                    }
-                }
-                Err(error) => {
-                    let error = AppError::Discovery(Box::new(error));
-
-                    terminal::write_diagnostic(&mut diagnostics, &error)
-                        .map_err(AppError::Diagnostic)?;
-                    had_errors = true;
-                }
             }
         }
     }
@@ -329,26 +409,25 @@ fn search_file(
     headings: &mut terminal::HeadingState,
     writer: &mut impl Write,
 ) -> Result<bool, AppError> {
-    options.cancellation.check()?;
+    let FileSearchOptions {
+        search,
+        terminal,
+        heading,
+    } = options;
 
-    if options.max_count == Some(0) || *remaining_results == Some(0) {
-        return Ok(false);
-    }
+    let heading_enabled = heading
+        && !search.quiet
+        && matches!(
+            search.output_mode,
+            OutputMode::Lines | OutputMode::OnlyMatching
+        );
 
-    let input = reader::open(path).map_err(|source| AppError::Open {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut emit = |event| {
+        terminal::write_execution_event(writer, path, event, terminal, heading_enabled, headings)
+            .map_err(AppError::Output)
+    };
 
-    search_reader(
-        input,
-        path,
-        matcher,
-        options,
-        remaining_results,
-        headings,
-        writer,
-    )
+    sequential::process_file(path, matcher, search, remaining_results, &mut emit)
 }
 
 fn search_reader(
@@ -361,198 +440,24 @@ fn search_reader(
     writer: &mut impl Write,
 ) -> Result<bool, AppError> {
     let FileSearchOptions {
+        search,
         terminal,
-        before_context,
-        after_context,
-        max_count,
-        quiet,
-        output_mode,
         heading,
-        cancellation,
-        binary_policy,
     } = options;
 
-    cancellation.check()?;
+    let heading_enabled = heading
+        && !search.quiet
+        && matches!(
+            search.output_mode,
+            OutputMode::Lines | OutputMode::OnlyMatching
+        );
 
-    if max_count == Some(0) || *remaining_results == Some(0) {
-        return Ok(false);
-    }
-
-    let heading_enabled =
-        heading && !quiet && matches!(output_mode, OutputMode::Lines | OutputMode::OnlyMatching);
-
-    if heading_enabled {
-        headings.begin_file();
-    }
-
-    let terminal = TerminalOptions {
-        show_filename: terminal.show_filename && !heading_enabled,
-        ..terminal
+    let mut emit = |event| {
+        terminal::write_execution_event(writer, path, event, terminal, heading_enabled, headings)
+            .map_err(AppError::Output)
     };
 
-    let context_enabled =
-        !quiet && output_mode == OutputMode::Lines && (before_context > 0 || after_context > 0);
-    let mut context = ContextSelector::new(before_context, after_context);
-    let mut found_selected_line = false;
-    let mut remaining = max_count;
-    let mut trailing_remaining: Option<usize> = None;
-
-    let counting = matches!(
-        output_mode,
-        OutputMode::CountLines | OutputMode::CountMatches
-    );
-    let mut total: u128 = 0;
-
-    let mut lines = reader::classified_lines(
-        reader::CancellationReader::new(input, cancellation),
-        binary_policy,
-    );
-    loop {
-        cancellation.check()?;
-
-        let Some(line) = lines.next() else {
-            break;
-        };
-
-        cancellation.check()?;
-
-        let input_line = line.map_err(|source| AppError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-        let (line_number, text) = match input_line {
-            reader::InputLine::Text { line_number, text } => (line_number, text),
-            reader::InputLine::Binary => {
-                return Ok(output_mode != OutputMode::FilesWithoutMatch && found_selected_line);
-            }
-        };
-
-        let selected = trailing_remaining.is_none() && matcher.is_selected(&text);
-        found_selected_line |= selected;
-
-        if selected {
-            remaining = remaining.map(|count| count.saturating_sub(1));
-            *remaining_results = (*remaining_results).map(|count| count.saturating_sub(1));
-
-            if matches!(
-                output_mode,
-                OutputMode::FilesWithMatches | OutputMode::FilesWithoutMatch
-            ) {
-                let qualifies = output_mode == OutputMode::FilesWithMatches;
-
-                if qualifies && !quiet {
-                    terminal::write_path(writer, path, terminal).map_err(AppError::Output)?;
-                }
-
-                return Ok(qualifies);
-            }
-
-            if quiet {
-                return Ok(true);
-            }
-
-            if counting {
-                total += match output_mode {
-                    OutputMode::CountLines => 1,
-                    OutputMode::CountMatches => matcher.find_spans(&text).len() as u128,
-                    _ => unreachable!("counting requires a count output mode"),
-                };
-                if remaining == Some(0) || *remaining_results == Some(0) {
-                    break;
-                }
-
-                continue;
-            }
-
-            if remaining == Some(0) || *remaining_results == Some(0) {
-                trailing_remaining = Some(if output_mode == OutputMode::OnlyMatching {
-                    0
-                } else {
-                    after_context
-                });
-            }
-        } else if let Some(count) = trailing_remaining.as_mut() {
-            *count = count.saturating_sub(1);
-        }
-
-        if context_enabled {
-            let spans = if selected {
-                matcher.find_spans(&text)
-            } else {
-                Vec::new()
-            };
-
-            let line = SearchLine {
-                line_number,
-                text,
-                spans,
-                selected,
-            };
-
-            for event in context.push(line) {
-                if heading_enabled {
-                    headings
-                        .before_record(writer, path)
-                        .map_err(AppError::Output)?;
-                }
-
-                terminal::write_event(writer, path, &event, terminal).map_err(AppError::Output)?;
-            }
-        } else if selected {
-            let matched_line = LineMatch {
-                line_number,
-                text: &text,
-                spans: matcher.find_spans(&text),
-            };
-
-            if output_mode == OutputMode::OnlyMatching {
-                let has_visible_match = matched_line.spans.iter().any(|span| !span.is_empty());
-
-                if heading_enabled && has_visible_match {
-                    headings
-                        .before_record(writer, path)
-                        .map_err(AppError::Output)?;
-                }
-
-                terminal::write_only_matching(writer, path, &matched_line, terminal)
-                    .map_err(AppError::Output)?;
-            } else {
-                if heading_enabled {
-                    headings
-                        .before_record(writer, path)
-                        .map_err(AppError::Output)?;
-                }
-
-                terminal::write_match(writer, path, &matched_line, terminal)
-                    .map_err(AppError::Output)?;
-            }
-        }
-
-        if trailing_remaining == Some(0) {
-            break;
-        }
-    }
-
-    cancellation.check()?;
-
-    if counting {
-        if !quiet {
-            terminal::write_count(writer, path, total, terminal).map_err(AppError::Output)?;
-        }
-
-        return Ok(found_selected_line);
-    }
-
-    if output_mode == OutputMode::FilesWithoutMatch {
-        if !quiet {
-            terminal::write_path(writer, path, terminal).map_err(AppError::Output)?;
-        }
-
-        return Ok(true);
-    }
-
-    Ok(found_selected_line)
+    sequential::process_reader(input, path, matcher, search, remaining_results, &mut emit)
 }
 
 fn load_path_lists(
@@ -641,6 +546,7 @@ fn load_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::binary::BinaryPolicy;
 
     #[test]
     fn broken_stdout_preserves_earlier_error_status() {
@@ -725,15 +631,17 @@ mod tests {
             PatternMatcher::new(&patterns, Default::default()).expect("valid pattern must compile");
 
         let options = FileSearchOptions {
-            cancellation: &cancellation,
+            search: SearchOptions {
+                cancellation: &cancellation,
+                before_context: 0,
+                after_context: 0,
+                max_count: None,
+                quiet: false,
+                output_mode: OutputMode::Lines,
+                binary_policy: BinaryPolicy::Skip,
+            },
             terminal: TerminalOptions::default(),
-            before_context: 0,
-            after_context: 0,
-            max_count: None,
-            quiet: false,
-            output_mode: OutputMode::Lines,
             heading: false,
-            binary_policy: BinaryPolicy::Skip,
         };
 
         let mut input = io::Cursor::new(b"Rust\n");
@@ -853,15 +761,17 @@ mod tests {
             };
 
             let options = FileSearchOptions {
-                cancellation: &cancellation,
+                search: SearchOptions {
+                    before_context: 0,
+                    after_context: 0,
+                    max_count: None,
+                    quiet: false,
+                    output_mode,
+                    cancellation: &cancellation,
+                    binary_policy: BinaryPolicy::Skip,
+                },
                 terminal: TerminalOptions::default(),
-                before_context: 0,
-                after_context: 0,
-                max_count: None,
-                quiet: false,
-                output_mode,
                 heading: false,
-                binary_policy: BinaryPolicy::Skip,
             };
 
             let mut remaining_results = None;

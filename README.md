@@ -4,7 +4,7 @@
 
 Active development. The CLI supports local regex and literal search in files and stdin, binary detection with a text override, path-list input, context lines, selection limits, quiet mode, file lists, counts, match-only output, filename and byte-column controls, match highlighting, headings, NUL-delimited filenames, recursive traversal, path filters, ignore controls, symbolic links, contextual error diagnostics, Ctrl+C cancellation, and graceful handling of closed stdout pipes.
 
-The developer reports passing Windows formatting, Clippy, and test checks, including matching, discovery, context, limits, and all implemented output modes. Unix-only tests remain unverified on Unix.
+The developer reports passing Windows formatting, Clippy, and test checks, including matching, discovery, context, limits, output modes, bounded parallel execution, and path ordering. Unix-only tests remain unverified on Unix.
 
 ## Overview
 
@@ -70,6 +70,8 @@ Use the explicit target `-` to search stdin. With no target, redirected stdin is
 | `-e PATTERN`, `--regexp PATTERN` | Add a pattern; repeat to add more |
 | `-f FILE`, `--file FILE` | Read UTF-8 patterns from a file or `-` for stdin; repeat for distinct sources |
 | `--text` | Disable NUL-based binary detection for search content; UTF-8 is still required |
+| `-j NUM`, `--threads NUM` | Request a positive search-worker count; default `1` |
+| `--sort none\|path` | Stream candidate order or sort native paths before processing; default `none` |
 | `-n`, `--line-number` | Include line numbers |
 | `--column` | Include one-based byte columns and imply line numbers |
 | `--color auto\|always\|never` | Highlight matched text; default `auto` enables color when stdout is a terminal |
@@ -116,6 +118,14 @@ Only matched text is highlighted. Filenames, headings, numbers, context, counts,
 Search reads complete byte lines and checks for NUL before decoding UTF-8. By default, a NUL byte stops the affected input without a diagnostic or operational error. The affected line is not matched or printed, and later files can continue. This is a binary-content heuristic, not an encoding detector. `--text` disables the NUL check and preserves NUL bytes in valid UTF-8 content. Invalid UTF-8 on a line that reaches decoding remains a read error with status `2`.
 
 Binary detection is streaming. Matches and context already printed remain. Earlier selections still consume selection budgets and determine exit status, even if a binary stop suppresses an unfinished count record. A binary stop does not qualify an input for `--files-without-match`. Quiet mode, file decisions, and selection limits can stop before later binary content is inspected. The policy applies equally to files and search stdin. Pattern sources and path lists retain their own validation rules. Enumeration reads no content and rejects `--text`.
+
+`-j 1` uses sequential execution. Larger positive counts enable a fixed worker pool for filesystem search when quiet mode and a finite global selection limit are absent. Stdin, enumeration, quiet searches, and searches with `--max-results` retain sequential execution. Per-file limits work with the worker pool. Zero, negative, and invalid worker counts are rejected.
+
+Workers process files and send owned events through bounded channels. The coordinator renders each file group in candidate order, preserving headings, context, counts, and partial-read-error behavior. At most the requested number of files are in flight, each with a bounded event queue. A slow early file can delay later groups. This does not bound individual line sizes or the memory used by loaded pattern sources and path lists. Worker setup failures and unexpected disconnections are operational errors. On output failure or cancellation, the coordinator closes queues and joins workers; active blocking I/O can still delay shutdown.
+
+`--sort none` retains streaming discovery order. `--sort path` collects eligible paths across all roots and sorts them before search or enumeration. This overrides the default ordering rules above. Sorting uses Rust's native path ordering on the current platform; paths are not converted to display strings. Duplicates remain, and equal keys retain their input order. Per-file record order is unchanged. Stdin remains one input.
+
+Path sorting completes discovery and reports its errors before target output. Quiet mode can therefore observe discovery errors that unsorted early stopping would leave unseen. Finite global limits process the sorted prefix without reading later file contents. A zero global limit still returns before target discovery. Candidate collection requires memory proportional to the path list and delays the first result; result queues remain bounded. Cancellation is checked during collection and before and after sorting, but cannot interrupt the sort operation itself.
 
 `--heading` prints a file path once before its first visible line or match-only record and removes repeated filename prefixes beneath it. It retains line numbers, columns, and context markers. Visible file groups have one blank line between them, with no leading or extra trailing blank line. Context groups within a file retain `--` separators. Files without visible records produce no heading, including match-only files with only zero-width matches. Headings conflict with `-h` and are compatible with `-H`. Count and file-list modes ignore headings; quiet mode suppresses them. Read errors preserve headings and records already printed, while errors before a visible record produce no heading.
 
@@ -169,7 +179,7 @@ Each pattern yields nonoverlapping matches. Spans from different patterns are so
 |---|---|
 | `0` | At least one selected line or qualifying file, or successful help/version output |
 | `1` | No selected lines or qualifying files for the requested mode |
-| `2` | Usage, pattern, discovery, open, read, output, signal-setup error, or cancellation |
+| `2` | Usage, pattern, discovery, open, read, output, signal-setup or worker error, or cancellation |
 
 For search, all pattern files are loaded and all patterns are compiled before target discovery. A pattern-file or compilation failure stops execution before search output. Discovery, target-file open, and target-file read errors are reported while other available candidates continue. A read error stops the affected file. Previously printed matches remain on stdout. Any operational error makes the final status `2`, even if selected lines were printed. Output errors stop execution. Invalid UTF-8 that reaches text decoding is a read error; NUL detection can stop a line before decoding. A non-UTF-8 pattern is a usage error. Enumeration bypasses pattern loading and content reading.
 
@@ -328,6 +338,13 @@ Terminal command (run from repository root)
 cargo run -- --text -n Rust tests/fixtures/text/demo.txt
 ```
 
+Search files with two workers and emit file groups in path order.
+
+Terminal command (run from repository root)
+```powershell
+cargo run -- -j2 --sort=path -n Rust tests/fixtures/text
+```
+
 ## Design summary
 
 - `src/lib.rs` exposes the search module.
@@ -336,16 +353,20 @@ cargo run -- --text -n Rust tests/fixtures/text/demo.txt
 - `src/cli/config.rs` converts parsed arguments into validated settings.
 - `src/app.rs` connects configuration, input, matching, and output.
 - Enumeration dispatch occurs before pattern loading and stdin detection. Its application helper connects the existing walker directly to path rendering.
-- Per-file settings and the shared global selection budget stay in `src/app.rs`; matchers and context selection do not own search limits.
+- `src/execution/mod.rs` defines processing settings, mode selection, and owned execution events. Presentation settings stay separate. The application owns the shared global selection budget and lends it to processing.
+- `src/execution/sequential.rs` processes one buffered input, applies selection limits and binary policy, qualifies files, and emits events through a fallible callback. It performs no terminal rendering. A callback error stops further reading.
+- Its file entry point checks cancellation and zero limits before opening input, preserving contextual open failures.
+- `src/execution/parallel.rs` owns the fixed worker pool, bounded job/event channels, active-file window, coordinator, and worker joins. Workers reuse the sequential file processor; the application renders coordinator events. The `crossbeam-channel` 0.5 dependency supplies bounded multi-consumer job queues and timed receives for cancellation polling.
+- `src/execution/ordering.rs` owns streaming/path-order policy and cancellable candidate collection. The application shares discovery and ordering preparation across sequential search, parallel search, and enumeration.
 - `src/discovery/walker.rs` yields regular-file candidates and traversal errors without reading file contents.
 - `src/discovery/ignore.rs` configures local ignore sources and checks enabled sources for I/O errors.
 - `src/discovery/filters.rs` compiles glob and file-type filters, configures depth limits, and checks file sizes while preserving metadata errors.
 - `src/error.rs` preserves the operation, path, and underlying I/O error, and distinguishes result-output failures from diagnostic failures.
 - `src/input/reader.rs` opens files, reads byte lines, and yields numbered UTF-8 text or a terminal binary event. LF/CRLF endings are removed; read and decoding failures stop the iterator.
-- `src/input/binary.rs` owns the NUL-based skip/text policy. Detection precedes decoding; the application handles binary stops without coupling pure matching to input classification. No new dependency is required.
+- `src/input/binary.rs` owns the NUL-based skip/text policy. Detection precedes decoding; the sequential processor handles binary stops without coupling pure matching to input classification. No new dependency is required.
 - Its cancellation-aware reader checks the shared token before reads for search content, pattern sources, and path lists. Application code translates cancellation into an application error.
 - `src/execution/cancel.rs` owns an `Arc<AtomicBool>` cancellation token and Ctrl+C handler registration. Search settings borrow the token; pure matching remains independent of cancellation. The `ctrlc` 3 dependency supplies cross-platform signal handling without application-defined unsafe code.
-- `src/input/stdin.rs` locks stdin, defines its display label, and resolves optional targets from terminal status. The application performs terminal detection. File opening and shared buffered-reader processing are separate functions in `src/app.rs`.
+- `src/input/stdin.rs` locks stdin, defines its display label, and resolves optional targets from terminal status. The application performs terminal detection and opens files; files and stdin use the same sequential processor.
 - `src/search/mod.rs` exposes the matcher and result type.
 - `src/input/patterns.rs` reads UTF-8 pattern files or locked stdin without trimming pattern text. Validated pattern-source variants and application target selection prevent consuming stdin twice.
 - `src/input/paths.rs` reads line-based path lists and preserves platform-specific filename rules. The application loads lists before discovery and shares selection budgets across their roots. This requires no new dependency.
@@ -355,12 +376,12 @@ cargo run -- --text -n Rust tests/fixtures/text/demo.txt
 - `src/search/context.rs` retains preceding lines and emits selected lines, context lines, and group breaks without I/O.
 - `src/search/result.rs` defines borrowed `LineMatch` results, validated byte ranges in `MatchSpan`, and internal owned line events.
 - `src/output/terminal.rs` renders selected lines, context lines, and group breaks, and propagates write errors. The application flushes stdout.
-- `src/output/mod.rs` defines the internal output mode. File qualification stays in the application; the terminal module renders qualifying paths.
+- `src/output/mod.rs` defines terminal formatting options. File qualification stays in execution; the terminal module renders qualifying paths and completed counts.
 - `TerminalOptions` groups filename, line-number, column, NUL, and color formatting. Line, context, and match-only rendering share prefix formatting; diagnostics stay separate.
 - `src/output/color.rs` resolves the color policy, selects a plain or styled stdout writer, validates spans, and merges highlighted ranges. The `anstream` 1 dependency adapts enabled styling for terminal capabilities, including Windows console fallback. Disabled styling retains the raw writer. Search logic remains independent of color and clap.
 - A shared filename writer handles displayed delimiters and platform-aware NUL filename bytes. File-list, count, line, and match-only modes use it without new dependencies.
-- `HeadingState` tracks visible file groups in the terminal module. The application marks file boundaries and requests a heading only before visible records.
-- Count accumulation stays in the application and uses `u128`; the terminal module renders count records and preserves write errors.
+- `HeadingState` tracks visible file groups in the terminal module. Execution emits file-boundary events; the renderer emits headings only before visible records.
+- Count accumulation stays in the sequential processor and uses `u128`; the terminal module renders count events and preserves write errors.
 - Match-only rendering borrows original line text and uses checked byte slices for each span, without cloning substrings or repeating matching.
 - `tests/search.rs` tests the public library interface without filesystem input.
 - `tests/app.rs` checks executable output, stderr, and successful exit status.
@@ -395,6 +416,14 @@ Discovery tests cover nested and empty trees, independent line numbers, hidden e
 Context tests cover zero counts, before-only and after-only selection, file boundaries, overlapping and adjacent windows, separate groups, Unicode text and byte spans, rendering failures, option precedence, inversion, per-file reset, no selections, and partial context output before read errors.
 
 Limit tests cover unlimited defaults, zero, selected-line counts, per-file resets, shared global budgets, inversion, trailing context, pattern validation before a zero global limit, and read errors before versus beyond the stopping point.
+
+The sequential processor has a unit test for callback failure: after a consumer rejects the first selected-line event, the next line remains unread and the remaining global budget is preserved. Existing executable tests exercise the same processor through terminal rendering.
+
+Worker-count tests cover defaults, short/long syntax, missing values, zero, negative values, and overflow. Executable tests compare one and two workers for lines, context, headings, counts, match-only and file-list modes, partial read errors, per-file limits, and sequential fallbacks. Closed-stdout tests cover multiple active workers, large output, color, headings, earlier discovery errors, and timed shutdown. Coordinator unit tests cover disconnected job receivers, missing completion, and cancellation while worker output remains open. Parallel behavior still requires Linux and macOS verification.
+
+Bounds tests count candidate pulls to verify the active-file window. A synchronized paused-consumer test verifies that the per-file event queue fills and blocks further sends. It acknowledges the first consumed event before the producer fills the queue, so the asserted send count does not depend on startup scheduling. Both tests verify termination after consumer failure.
+
+Ordering tests cover parser choices, reversed roots, duplicate preservation with one and two workers, enumeration, NUL delimiters, sorted global limits, quiet-mode discovery errors, and zero limits before discovery. Unit tests verify lazy unsorted preparation, cancellation during collection, and diagnostic failures stopping discovery. A Unix-only executable test checks sorting and NUL output for filenames with distinct non-UTF-8 bytes; its Unix execution remains unverified.
 
 Quiet-mode tests cover short, long, and combined flags, selection and no selection, inversion, zero limits, skipped trailing context, unread trailing errors, pattern errors, and an earlier discovery error followed by a selection.
 
@@ -461,7 +490,7 @@ Only regular-file candidates are searched. Link following can leave the supplied
 
 ## Planned features
 
-- Bounded parallel search and performance benchmarks.
+- Performance benchmarks and optimization.
 - JSON Lines, statistics, configuration files, and shell completions.
 - Cross-platform CI and distributable release binaries.
 - Optional terminal UI and local indexing.

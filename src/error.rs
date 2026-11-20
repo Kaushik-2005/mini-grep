@@ -15,6 +15,7 @@ pub enum AppError {
     Pattern(Box<::regex::Error>),
     Cancelled,
     Signal(ctrlc::Error),
+    Worker(io::Error),
 }
 
 impl fmt::Display for AppError {
@@ -43,6 +44,9 @@ impl fmt::Display for AppError {
             Self::Signal(source) => {
                 write!(formatter, "cannot install Ctrl+C handler: {source}")
             }
+            Self::Worker(source) => {
+                write!(formatter, "cannot execute search worker: {source}")
+            }
             Self::Cancelled => write!(formatter, "operation cancelled"),
         }
     }
@@ -59,6 +63,7 @@ impl Error for AppError {
             | Self::Output(source)
             | Self::Diagnostic(source) => Some(source),
             Self::Pattern(error) => Some(error.as_ref()),
+            Self::Worker(source) => Some(source),
             Self::Signal(source) => Some(source),
         }
     }

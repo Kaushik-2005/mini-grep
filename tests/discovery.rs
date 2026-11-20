@@ -2210,3 +2210,264 @@ fn binary_inputs_do_not_block_later_roots_or_file_enumeration() {
         assert_eq!(output.stdout, expected, "arguments: {arguments:?}");
     }
 }
+
+#[test]
+fn parallel_workers_preserve_sequential_file_results() {
+    let fixture = Fixture::new();
+    fixture.write("first.txt", b"Rust Rust\nGo\n");
+    fixture.write("second.txt", b"before\nRust\n");
+    fixture.write("broken.txt", b"Rust\n\xff\n");
+    fixture.write("targets.paths", b"first.txt\nsecond.txt\nbroken.txt\n");
+
+    let cases: &[&[&str]] = &[
+        &["-n", "Rust"],
+        &["-n", "-C", "1", "Rust"],
+        &["--heading", "-n", "Rust"],
+        &["-c", "Rust"],
+        &["--count-matches", "Rust"],
+        &["-no", "Rust"],
+        &["-l", "Rust"],
+        &["--files-without-match", "absent"],
+        &["-n", "-m", "1", "Rust"],
+        &["-q", "Rust"],
+        &["-n", "--max-results", "1", "Rust"],
+    ];
+
+    for arguments in cases {
+        let run = |threads: &str| {
+            Command::new(env!("CARGO_BIN_EXE_mini-grep"))
+                .current_dir(&fixture.root)
+                .arg(threads)
+                .args(*arguments)
+                .args(["--files-from", "targets.paths"])
+                .output()
+                .expect("executable must start")
+        };
+
+        let sequential = run("-j1");
+        let parallel = run("-j2");
+
+        assert_eq!(
+            parallel.status.code(),
+            sequential.status.code(),
+            "arguments: {arguments:?}",
+        );
+        assert_eq!(
+            parallel.stdout, sequential.stdout,
+            "arguments: {arguments:?}",
+        );
+        assert_eq!(
+            parallel.stderr, sequential.stderr,
+            "arguments: {arguments:?}",
+        );
+    }
+}
+
+#[test]
+fn path_sorting_orders_search_roots_and_preserves_duplicates() {
+    let fixture = Fixture::new();
+    fixture.write("z.txt", b"Rust\n");
+    fixture.write("a.txt", b"Rust\n");
+    fixture.write("targets.paths", b"z.txt\na.txt\nz.txt\n");
+
+    for threads in ["1", "2"] {
+        for (order, expected) in [
+            ("none", "z.txt:1:Rust\na.txt:1:Rust\nz.txt:1:Rust\n"),
+            ("path", "a.txt:1:Rust\nz.txt:1:Rust\nz.txt:1:Rust\n"),
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
+                .current_dir(&fixture.root)
+                .args([
+                    "-n",
+                    "Rust",
+                    "--files-from",
+                    "targets.paths",
+                    "--sort",
+                    order,
+                    "--threads",
+                    threads,
+                ])
+                .output()
+                .expect("executable must start");
+
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "order: {order}; threads: {threads}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(output.stderr.is_empty());
+            assert_eq!(output.stdout, expected.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn enumeration_sorting_preserves_duplicates_and_null_delimiters() {
+    let fixture = Fixture::new();
+    fixture.write("z.txt", b"Rust\n");
+    fixture.write("a.txt", b"Rust\n");
+    fixture.write("targets.paths", b"z.txt\na.txt\nz.txt\n");
+
+    let cases: &[(&[&str], &[u8])] = &[
+        (&["--sort=none"], b"z.txt\na.txt\nz.txt\n"),
+        (&["--sort=path"], b"a.txt\nz.txt\nz.txt\n"),
+        (&["--sort=path", "-0"], b"a.txt\0z.txt\0z.txt\0"),
+    ];
+
+    for &(flags, expected) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
+            .current_dir(&fixture.root)
+            .arg("--files")
+            .args(flags)
+            .args(["--files-from", "targets.paths"])
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "flags: {flags:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.stdout, expected, "flags: {flags:?}");
+    }
+}
+
+#[test]
+fn sorted_global_limit_reads_only_the_sorted_prefix() {
+    let fixture = Fixture::new();
+    fixture.write("z.txt", b"\xff\n");
+    fixture.write("a.txt", b"Rust\n");
+    fixture.write("targets.paths", b"z.txt\na.txt\n");
+
+    for threads in ["1", "2"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
+            .current_dir(&fixture.root)
+            .args([
+                "-n",
+                "Rust",
+                "--sort=path",
+                "--max-results=1",
+                "--threads",
+                threads,
+                "--files-from",
+                "targets.paths",
+            ])
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.stdout, b"a.txt:1:Rust\n");
+    }
+}
+
+#[test]
+fn sorted_quiet_mode_reports_discovery_errors_before_stopping() {
+    let fixture = Fixture::new();
+    fixture.write("z.txt", b"Rust\n");
+    fixture.write("a.txt", b"Rust\n");
+    fixture.write("targets.paths", b"z.txt\na.txt\nmissing.txt\n");
+
+    let modes: &[&[&str]] = &[&["-q", "Rust"], &["--files", "-q"]];
+
+    for mode in modes {
+        for order in ["none", "path"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
+                .current_dir(&fixture.root)
+                .args(*mode)
+                .args(["-j2", "--sort", order, "--files-from", "targets.paths"])
+                .output()
+                .expect("executable must start");
+
+            assert!(output.stdout.is_empty());
+
+            if order == "none" {
+                assert_eq!(output.status.code(), Some(0));
+                assert!(output.stderr.is_empty());
+            } else {
+                assert_eq!(output.status.code(), Some(2));
+
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("missing.txt"), "{stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn sorted_zero_global_limit_skips_target_discovery() {
+    let fixture = Fixture::new();
+    fixture.write("targets.paths", b"missing.txt\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
+        .current_dir(&fixture.root)
+        .args([
+            "-j2",
+            "--sort=path",
+            "--max-results=0",
+            "Rust",
+            "--files-from",
+            "targets.paths",
+        ])
+        .output()
+        .expect("executable must start");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn sorted_paths_preserve_non_utf8_filename_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new();
+    let high = b"z-\xff.txt";
+    let low = b"z-\xfe.txt";
+
+    for name in [high, low] {
+        let path = fixture.root.join(OsString::from_vec(name.to_vec()));
+
+        fs::write(path, b"Rust\n").expect("native-byte fixture must be written");
+    }
+
+    let mut paths = high.to_vec();
+    paths.push(b'\n');
+    paths.extend_from_slice(low);
+    paths.push(b'\n');
+    fixture.write("targets.paths", &paths);
+
+    let cases: &[(&[&str], &[u8])] = &[(&["--files"], b""), (&["-n", "Rust"], b"1:Rust\n")];
+
+    for &(arguments, suffix) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
+            .current_dir(&fixture.root)
+            .args(arguments)
+            .args(["-j2", "--sort=path", "-0", "--files-from", "targets.paths"])
+            .output()
+            .expect("executable must start");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(output.stderr.is_empty());
+
+        let mut expected = Vec::new();
+
+        for name in [low, high] {
+            expected.extend_from_slice(name);
+            expected.push(0);
+            expected.extend_from_slice(suffix);
+        }
+
+        assert_eq!(output.stdout, expected);
+    }
+}
