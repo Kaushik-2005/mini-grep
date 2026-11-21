@@ -6,9 +6,13 @@ mini-grep is a standalone Rust command-line tool for local text search. It searc
 
 ## Project status
 
-Active development. The latest local Windows run passed formatting, linting, the full test suite, and all 65 benchmark smoke cases. Manual CLI checks have also been reported as passing. Linux and macOS are intended targets; their execution remains unverified.
+Core development is largely complete. The project has passed formatting, linting, the full test suite, and all 65 benchmark cases on Windows.
 
-The current interface is a command-line interface (CLI). Release binaries and automated cross-platform continuous integration (CI) are not available yet.
+Current work focuses on identifying performance bottlenecks and exploring further optimizations to improve search speed, memory efficiency, and resource utilization.
+
+Remaining development includes CLI utilities, cross-platform CI for Windows, Linux, and macOS, release preparation, versioning, and an optional terminal user interface (TUI).
+
+I will make proper documentation in a separate `\docs\` folder
 
 ## Features
 
@@ -449,13 +453,3 @@ File-backed mappings introduce safety requirements when other writers can modify
 - Cross-platform CI and release binaries.
 - Broader performance and memory measurements.
 - Optional terminal user interface and local indexing.
-
-See [roadmap.md](roadmap.md) for the development plan.
-
-## Development workflow
-
-Follow [AGENTS.md](AGENTS.md). The human developer normally writes and runs implementation code, tests, benchmarks, configuration, and scripts. AI assistance provides teaching, review, requested code, and README maintenance. Direct implementation edits require explicit authorization.
-
-Keep matching independent of CLI parsing, filesystem discovery, scheduling, and rendering. Verify changes with the formatting, linting, and test commands above.
-
-No license is declared in this checkout.
