@@ -6,7 +6,8 @@ use crate::execution::cancel::CancellationToken;
 
 pub(crate) fn open(path: &Path) -> io::Result<BufReader<File>> {
     let file = File::open(path)?;
-    Ok(BufReader::new(file))
+    // Ok(BufReader::new(file))
+    Ok(BufReader::with_capacity(64 * 1024, file))
 }
 
 pub(crate) struct CancellationReader<'a, R> {
@@ -55,61 +56,89 @@ pub(crate) enum InputLine {
     Binary,
 }
 
-pub(crate) fn classified_lines(
-    mut reader: impl BufRead,
+pub(crate) struct ClassifiedLines<R> {
+    reader: R,
     policy: crate::input::binary::BinaryPolicy,
-) -> impl Iterator<Item = io::Result<InputLine>> {
-    let mut line_number = 0_usize;
-    let mut stopped = false;
+    bytes: Vec<u8>,
+    line_number: usize,
+    stopped: bool,
+}
 
-    std::iter::from_fn(move || {
-        if stopped {
+pub(crate) fn classified_lines(
+    reader: impl BufRead,
+    policy: crate::input::binary::BinaryPolicy,
+) -> ClassifiedLines<impl BufRead> {
+    ClassifiedLines {
+        reader,
+        policy,
+        bytes: Vec::new(),
+        line_number: 0,
+        stopped: false,
+    }
+}
+
+impl<R> ClassifiedLines<R> {
+    /// Returns a discarded line's allocation for the next read.
+    pub(crate) fn recycle(&mut self, text: String) {
+        self.bytes = text.into_bytes();
+        self.bytes.clear();
+    }
+}
+
+impl<R: BufRead> Iterator for ClassifiedLines<R> {
+    type Item = io::Result<InputLine>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.stopped {
             return None;
         }
 
-        let mut bytes = Vec::new();
-
-        match reader.read_until(b'\n', &mut bytes) {
+        match self.reader.read_until(b'\n', &mut self.bytes) {
             Ok(0) => {
-                stopped = true;
+                self.stopped = true;
                 return None;
             }
             Ok(_) => {}
             Err(error) => {
-                stopped = true;
+                self.stopped = true;
                 return Some(Err(error));
             }
         }
 
-        if policy.should_stop(&bytes) {
-            stopped = true;
+        if self.policy.should_stop(&self.bytes) {
+            self.stopped = true;
             return Some(Ok(InputLine::Binary));
         }
 
-        if bytes.last() == Some(&b'\n') {
-            bytes.pop();
+        if self.bytes.last() == Some(&b'\n') {
+            self.bytes.pop();
 
-            if bytes.last() == Some(&b'\r') {
-                bytes.pop();
+            if self.bytes.last() == Some(&b'\r') {
+                self.bytes.pop();
             }
         }
 
-        line_number = match line_number.checked_add(1) {
+        self.line_number = match self.line_number.checked_add(1) {
             Some(number) => number,
             None => {
-                stopped = true;
+                self.stopped = true;
                 return Some(Err(io::Error::other("line number exceeds usize")));
             }
         };
 
+        let bytes = std::mem::take(&mut self.bytes);
+
         match String::from_utf8(bytes) {
-            Ok(text) => Some(Ok(InputLine::Text { line_number, text })),
+            Ok(text) => Some(Ok(InputLine::Text {
+                line_number: self.line_number,
+                text,
+            })),
             Err(error) => {
-                stopped = true;
+                self.stopped = true;
                 Some(Err(io::Error::new(io::ErrorKind::InvalidData, error)))
             }
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -349,5 +378,38 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn recycled_buffer_preserves_capacity_and_clears_old_text() -> io::Result<()> {
+        use crate::input::binary::BinaryPolicy;
+
+        let input = Cursor::new(b"a longer first line\r\nx\n\nlast");
+        let mut lines = classified_lines(input, BinaryPolicy::Skip);
+
+        for (index, expected) in ["a longer first line", "x", "", "last"]
+            .into_iter()
+            .enumerate()
+        {
+            let line = lines.next().expect("line must exist")?;
+
+            let InputLine::Text { line_number, text } = line else {
+                panic!("text input must produce a text line");
+            };
+
+            assert_eq!(line_number, index + 1);
+            assert_eq!(text, expected);
+
+            let capacity = text.capacity();
+            lines.recycle(text);
+
+            assert!(lines.bytes.is_empty());
+            assert_eq!(lines.bytes.capacity(), capacity);
+        }
+
+        assert!(lines.next().is_none());
+        assert!(lines.next().is_none());
+
+        Ok(())
     }
 }

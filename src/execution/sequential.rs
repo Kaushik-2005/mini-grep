@@ -130,6 +130,7 @@ pub(crate) fn process_reader(
                     break;
                 }
 
+                lines.recycle(text);
                 continue;
             }
 
@@ -177,6 +178,8 @@ pub(crate) fn process_reader(
             };
 
             emit(event)?;
+        } else {
+            lines.recycle(text);
         }
 
         if trailing_remaining == Some(0) {

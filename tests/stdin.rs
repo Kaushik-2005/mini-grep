@@ -97,7 +97,7 @@ fn stdin_reuses_output_modes_and_formatting() {
             0,
             "(standard input)\n2:é Rust Rust\n",
         ),
-        (&["-0c"], "Rust", 0, "(standard input)\01\n"),
+        (&["-0c"], "Rust", 0, "(standard input)\x001\n"),
         (&["-0l"], "Rust", 0, "(standard input)\0"),
         (&["-q"], "Rust", 0, ""),
     ];

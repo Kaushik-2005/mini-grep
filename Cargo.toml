@@ -11,3 +11,27 @@ ctrlc = "3"
 ignore = "0.4"
 regex = "1"
 regex-syntax = "0.8"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "literal"
+harness = false
+
+[[bench]]
+name = "repository"
+harness = false
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
+
+[[bench]]
+name = "reader"
+harness = false
+
+[[bench]]
+name = "source_tree"
+harness = false
