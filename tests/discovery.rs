@@ -2433,7 +2433,25 @@ fn sorted_paths_preserve_non_utf8_filename_bytes() {
     for name in [high, low] {
         let path = fixture.root.join(OsString::from_vec(name.to_vec()));
 
-        fs::write(path, b"Rust\n").expect("native-byte fixture must be written");
+        if let Err(error) = fs::write(&path, b"Rust\n") {
+            #[cfg(target_os = "macos")]
+            {
+                const EILSEQ: i32 = 92;
+
+                if error.raw_os_error() == Some(EILSEQ) {
+                    eprintln!(
+                        "Skipping filesystem-dependent assertion: \
+                        this filesystem rejects non-UTF-8 filenames"
+                    );
+                    return;
+                }
+            }
+
+            panic!(
+                "cannot write native-byte fixture '{}': {error}",
+                path.display()
+            );
+        }
     }
 
     let mut paths = high.to_vec();

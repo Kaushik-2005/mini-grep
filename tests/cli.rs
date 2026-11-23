@@ -45,6 +45,32 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(unix)]
+fn rename_non_utf8_fixture(fixture: &mut Fixture, renamed: PathBuf) -> bool {
+    match fs::rename(&fixture.path, &renamed) {
+        Ok(()) => {
+            fixture.path = renamed;
+            true
+        }
+        Err(error) => {
+            #[cfg(target_os = "macos")]
+            {
+                const EILSEQ: i32 = 92;
+
+                if error.raw_os_error() == Some(EILSEQ) {
+                    eprintln!(
+                        "Skipping filesystem-dependent assertion: \
+                        this filesystem rejects non-UTF-8 filenames"
+                    );
+                    return false;
+                }
+            }
+
+            panic!("cannot rename fixture to '{}': {error}", renamed.display());
+        }
+    }
+}
+
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mini-grep"));
     command.current_dir(env!("CARGO_MANIFEST_DIR"));
@@ -219,8 +245,9 @@ fn accepts_a_non_utf8_file_path() {
         .directory
         .join(OsStr::from_bytes(b"sample-\xff.txt"));
 
-    fs::rename(&fixture.path, &renamed).expect("fixture must be renamed");
-    fixture.path = renamed;
+    if !rename_non_utf8_fixture(&mut fixture, renamed) {
+        return;
+    }
 
     let output = search("Rust", &fixture.path);
 
@@ -2286,8 +2313,9 @@ fn null_output_preserves_non_utf8_paths_with_embedded_newlines() {
         .directory
         .join(std::ffi::OsStr::from_bytes(b"sample-\xff\n.txt"));
 
-    fs::rename(&fixture.path, &renamed).expect("fixture must be renamed");
-    fixture.path = renamed;
+    if !rename_non_utf8_fixture(&mut fixture, renamed) {
+        return;
+    }
 
     for file_list in [false, true] {
         let mut process = command();
@@ -2490,8 +2518,9 @@ fn listed_unix_paths_preserve_non_utf8_bytes_through_null_output() {
         .directory
         .join(std::ffi::OsStr::from_bytes(b"sample-\xff #.txt"));
 
-    fs::rename(&target.path, &renamed).expect("target fixture must be renamed");
-    target.path = renamed;
+    if !rename_non_utf8_fixture(&mut target, renamed) {
+        return;
+    }
 
     let mut contents = target.path.as_os_str().as_bytes().to_vec();
     contents.push(b'\n');
