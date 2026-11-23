@@ -208,16 +208,27 @@ fn config_path_does_not_load_invalid_configuration() {
     let document: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("path output must be valid JSON");
 
-    let expected_path = fixture.directory.join(".mini-grep.json");
+    assert_eq!(document["encoding"], "utf8");
+
+    let reported_path = PathBuf::from(
+        document["value"]
+            .as_str()
+            .expect("UTF-8 path value must be a string"),
+    );
+
+    assert!(reported_path.is_absolute());
+    assert_eq!(
+        reported_path.file_name(),
+        Some(std::ffi::OsStr::new(".mini-grep.json"))
+    );
+
+    let reported_directory = reported_path
+        .parent()
+        .expect("configuration path must have a parent");
 
     assert_eq!(
-        document,
-        serde_json::json!({
-            "encoding": "utf8",
-            "value": expected_path
-                .to_str()
-                .expect("fixture path must be UTF-8")
-        })
+        fs::canonicalize(reported_directory).expect("reported directory must exist"),
+        fs::canonicalize(&fixture.directory).expect("fixture directory must exist")
     );
 }
 
