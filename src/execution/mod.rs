@@ -2,6 +2,7 @@ pub(crate) mod cancel;
 pub(crate) mod ordering;
 pub(crate) mod parallel;
 pub(crate) mod sequential;
+pub(crate) mod stats;
 
 use self::cancel::CancellationToken;
 use crate::input::binary::BinaryPolicy;

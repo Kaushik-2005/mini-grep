@@ -2471,3 +2471,212 @@ fn sorted_paths_preserve_non_utf8_filename_bytes() {
         assert_eq!(output.stdout, expected);
     }
 }
+
+#[test]
+fn json_file_enumeration_emits_structured_paths() {
+    let fixture = Fixture::new();
+    let path = fixture.write("sample.txt", b"Rust\n");
+
+    let output = fixture.list_files(&["--json", "-0", "-h", "--column", "--color=always"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let expected = serde_json::json!({
+        "schema_version": 1,
+        "source": {
+            "kind": "file",
+            "path": {
+                "encoding": "utf8",
+                "value": path.to_str().expect("fixture path must be UTF-8")
+            }
+        },
+        "type": "path"
+    });
+
+    let mut expected_bytes = serde_json::to_vec(&expected).expect("expected JSON must serialize");
+    expected_bytes.push(b'\n');
+
+    let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+    let records: Vec<_> = stdout.lines().collect();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(records[0])
+            .expect("path record must be valid JSON"),
+        expected
+    );
+    assert!(stdout.ends_with('\n'));
+    assert!(!stdout.contains('\0'));
+    assert!(!stdout.contains('\u{1b}'));
+}
+
+#[test]
+fn quiet_json_file_enumeration_emits_nothing() {
+    let fixture = Fixture::new();
+    fixture.write("sample.txt", b"Rust\n");
+
+    let output = fixture.list_files(&["--json", "-q"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn empty_json_file_enumeration_returns_no_selection() {
+    let fixture = Fixture::new();
+
+    let output = fixture.list_files(&["--json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn json_search_preserves_file_sources_with_one_or_multiple_workers() {
+    let fixture = Fixture::new();
+    let first = fixture.write("(standard input)", b"Rust\n");
+    let second = fixture.write("nested/second.txt", b"before\nRust\n");
+
+    for workers in ["1", "2"] {
+        let output = fixture.search_with(&["--json", "-j", workers]);
+
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+        let records: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+            .collect();
+
+        assert_eq!(records.len(), 4);
+
+        for (path, line_number) in [(&first, 1), (&second, 2)] {
+            let source = serde_json::json!({
+                "kind": "file",
+                "path": {
+                    "encoding": "utf8",
+                    "value": path.to_str().expect("fixture path must be UTF-8")
+                }
+            });
+
+            assert!(records.contains(&serde_json::json!({
+                "schema_version": 1,
+                "source": source.clone(),
+                "type": "begin"
+            })));
+
+            assert!(records.contains(&serde_json::json!({
+                "schema_version": 1,
+                "source": source,
+                "type": "line",
+                "line_number": line_number,
+                "selected": true,
+                "text": "Rust",
+                "spans": [{ "start": 0, "end": 4 }]
+            })));
+        }
+
+        assert!(stdout.ends_with('\n'));
+    }
+}
+
+#[test]
+fn statistics_preserve_partial_file_totals_with_one_or_multiple_workers() {
+    let fixture = Fixture::new();
+    fixture.write("first.txt", b"Rust Rust\nGo\n");
+    fixture.write("nested/second.txt", b"Rust\nRust\n");
+    fixture.write("broken.txt", b"Rust\n\xff\n");
+
+    for workers in ["1", "2"] {
+        for order in ["none", "path"] {
+            let output =
+                fixture.search_with(&["--json", "--stats", "-j", workers, "--sort", order]);
+
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "workers: {workers}, order: {order}"
+            );
+
+            let stdout = std::str::from_utf8(&output.stdout).expect("JSON output must be UTF-8");
+            let records: Vec<serde_json::Value> = stdout
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+                .collect();
+
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record["type"] == "summary")
+                    .count(),
+                1
+            );
+
+            let summary = records.last().expect("summary must be present");
+            assert_eq!(summary["type"], "summary");
+            assert_eq!(summary["inputs_started"], "3");
+            assert_eq!(summary["inputs_with_selected_lines"], "3");
+            assert_eq!(summary["selected_lines"], "4");
+            assert_eq!(summary["matches"], "5");
+            assert_eq!(summary["errors"], "1");
+
+            let stderr = std::str::from_utf8(&output.stderr).expect("diagnostic must be UTF-8");
+            assert!(stderr.contains("broken.txt"), "{stderr}");
+            assert!(stdout.ends_with('\n'));
+        }
+    }
+}
+
+#[test]
+fn statistics_count_missing_root_discovery_errors_once() {
+    let fixture = Fixture::new();
+    let missing = fixture.root.join("missing.txt");
+
+    for workers in ["1", "2"] {
+        for order in ["none", "path"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_mini-grep"))
+                .args(["--json", "--stats", "-j", workers, "--sort", order, "Rust"])
+                .arg(&missing)
+                .output()
+                .expect("executable must start");
+
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "workers: {workers}, order: {order}"
+            );
+
+            let stdout = std::str::from_utf8(&output.stdout).expect("JSON output must be UTF-8");
+            let records: Vec<serde_json::Value> = stdout
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+                .collect();
+
+            assert_eq!(records.len(), 1);
+
+            let summary = &records[0];
+            assert_eq!(summary["type"], "summary");
+            assert_eq!(summary["inputs_started"], "0");
+            assert_eq!(summary["inputs_with_selected_lines"], "0");
+            assert_eq!(summary["selected_lines"], "0");
+            assert_eq!(summary["matches"], "0");
+            assert_eq!(summary["errors"], "1");
+
+            let stderr = std::str::from_utf8(&output.stderr).expect("diagnostic must be UTF-8");
+            assert!(stderr.contains("missing.txt"), "{stderr}");
+            assert!(stdout.ends_with('\n'));
+        }
+    }
+}

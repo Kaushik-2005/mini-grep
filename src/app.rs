@@ -1,17 +1,20 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use std::vec;
 
 use crate::AppError;
 use crate::cli::{self, PathListSource, PatternSource};
 use crate::discovery::{DiscoveryOptions, walker};
 use crate::execution::cancel::CancellationToken;
-use crate::execution::{OutputMode, SearchOptions, ordering, parallel, sequential};
+use crate::execution::stats::SearchStats;
+use crate::execution::{ExecutionEvent, OutputMode, SearchOptions, ordering, parallel, sequential};
 use crate::input::paths as path_input;
 use crate::input::patterns as pattern_input;
 use crate::input::reader;
 use crate::input::stdin;
-use crate::output::{TerminalOptions, color, terminal};
+use crate::output::stats as stats_output;
+use crate::output::{OutputFormat, TerminalOptions, color, json, terminal};
 use crate::search::PatternMatcher;
 
 #[derive(Debug)]
@@ -26,10 +29,60 @@ struct FileSearchOptions<'a> {
     search: SearchOptions<'a>,
     terminal: TerminalOptions,
     heading: bool,
+    format: OutputFormat,
+}
+
+struct SearchOutput<'a, W: Write> {
+    writer: &'a mut W,
+    headings: &'a mut terminal::HeadingState,
+    stats: Option<&'a mut SearchStats>,
+}
+
+impl FileSearchOptions<'_> {
+    fn write_event(
+        self,
+        writer: &mut impl Write,
+        path: &Path,
+        source: &json::Source<'_>,
+        event: ExecutionEvent,
+        headings: &mut terminal::HeadingState,
+    ) -> io::Result<()> {
+        if self.search.quiet {
+            return Ok(());
+        }
+
+        match self.format {
+            OutputFormat::Terminal => {
+                let heading_enabled = self.heading
+                    && matches!(
+                        self.search.output_mode,
+                        OutputMode::Lines | OutputMode::OnlyMatching
+                    );
+
+                terminal::write_execution_event(
+                    writer,
+                    path,
+                    event,
+                    self.terminal,
+                    heading_enabled,
+                    headings,
+                )
+            }
+            OutputFormat::Json => {
+                json::write_execution_event(writer, source, &event, self.search.output_mode)
+            }
+        }
+    }
 }
 
 pub fn run() -> Result<SearchOutcome, AppError> {
-    let config = cli::parse()?;
+    let config = match cli::parse()? {
+        cli::Invocation::Search(config) => *config,
+        cli::Invocation::Config(command) => return run_config(command),
+        cli::Invocation::Completions(shell) => return run_completions(shell),
+    };
+    let started = config.stats.then(Instant::now);
+    let mut statistics = config.stats.then(SearchStats::default);
 
     let cancellation = CancellationToken::default();
     cancellation.install_handler()?;
@@ -46,6 +99,7 @@ pub fn run() -> Result<SearchOutcome, AppError> {
             &roots,
             &config.discovery,
             config.sort,
+            config.output_format,
             TerminalOptions {
                 null: config.null,
                 ..TerminalOptions::default()
@@ -90,14 +144,11 @@ pub fn run() -> Result<SearchOutcome, AppError> {
             color: config.color.enabled(io::stdout().is_terminal()),
         },
         heading: config.heading,
+        format: config.output_format,
     };
     let mut remaining_results = config.max_results;
 
     cancellation.check()?;
-
-    if remaining_results == Some(0) {
-        return Ok(SearchOutcome::NoSelection);
-    }
 
     let (roots, use_stdin) = match listed_roots {
         Some(roots) => (roots, false),
@@ -113,7 +164,11 @@ pub fn run() -> Result<SearchOutcome, AppError> {
         }
     };
 
-    let mut writer = color::stdout(config.color);
+    let stdout_color = match config.output_format {
+        OutputFormat::Terminal => config.color,
+        OutputFormat::Json => color::ColorPolicy::Never,
+    };
+    let mut writer = color::stdout(stdout_color);
     let stderr = io::stderr();
     let mut diagnostics = stderr.lock();
 
@@ -122,11 +177,18 @@ pub fn run() -> Result<SearchOutcome, AppError> {
 
     let mut headings = terminal::HeadingState::default();
 
-    let candidates: Box<dyn Iterator<Item = Result<PathBuf, AppError>> + '_> = if use_stdin {
+    let candidates: Box<dyn Iterator<Item = Result<PathBuf, AppError>> + '_> = if use_stdin
+        || remaining_results == Some(0)
+    {
         Box::new(std::iter::empty())
     } else {
         let mut report = |error: AppError| {
             terminal::write_diagnostic(&mut diagnostics, &error).map_err(AppError::Diagnostic)?;
+
+            if let Some(stats) = statistics.as_mut() {
+                stats.errors = stats.errors.saturating_add(1);
+            }
+
             had_errors = true;
             Ok(())
         };
@@ -146,8 +208,11 @@ pub fn run() -> Result<SearchOutcome, AppError> {
             &matcher,
             options,
             &mut remaining_results,
-            &mut headings,
-            &mut writer,
+            SearchOutput {
+                writer: &mut writer,
+                headings: &mut headings,
+                stats: statistics.as_mut(),
+            },
         );
 
         match result {
@@ -169,25 +234,24 @@ pub fn run() -> Result<SearchOutcome, AppError> {
             }
         }
     } else if config.threads.get() > 1 && !config.quiet && remaining_results.is_none() {
-        let heading_enabled = options.heading
-            && matches!(
-                options.search.output_mode,
-                OutputMode::Lines | OutputMode::OnlyMatching
-            );
-
         let result = {
             let mut handle = |event: parallel::ParallelEvent<'_>| {
                 match event {
                     parallel::ParallelEvent::Output { path, event } => {
-                        terminal::write_execution_event(
-                            &mut writer,
-                            path,
-                            event,
-                            options.terminal,
-                            heading_enabled,
-                            &mut headings,
-                        )
-                        .map_err(AppError::Output)?;
+                        options
+                            .write_event(
+                                &mut writer,
+                                path,
+                                &json::Source::file(path),
+                                event,
+                                &mut headings,
+                            )
+                            .map_err(AppError::Output)?;
+                    }
+                    parallel::ParallelEvent::Statistics(snapshot) => {
+                        if let Some(stats) = statistics.as_mut() {
+                            stats.merge(snapshot);
+                        }
                     }
                     parallel::ParallelEvent::Finished(Ok(selected)) => {
                         found_result |= selected;
@@ -200,6 +264,12 @@ pub fn run() -> Result<SearchOutcome, AppError> {
 
                         terminal::write_diagnostic(&mut diagnostics, &error)
                             .map_err(AppError::Diagnostic)?;
+
+                        if matches!(&error, AppError::Discovery(_))
+                            && let Some(stats) = statistics.as_mut()
+                        {
+                            stats.errors = stats.errors.saturating_add(1);
+                        }
                         had_errors = true;
                     }
                 }
@@ -207,13 +277,23 @@ pub fn run() -> Result<SearchOutcome, AppError> {
                 Ok(())
             };
 
-            parallel::run(
-                candidates,
-                &matcher,
-                options.search,
-                config.threads,
-                &mut handle,
-            )
+            if config.stats {
+                parallel::run_with_stats(
+                    candidates,
+                    &matcher,
+                    options.search,
+                    config.threads,
+                    &mut handle,
+                )
+            } else {
+                parallel::run(
+                    candidates,
+                    &matcher,
+                    options.search,
+                    config.threads,
+                    &mut handle,
+                )
+            }
         };
 
         if let Err(error) = result {
@@ -241,8 +321,11 @@ pub fn run() -> Result<SearchOutcome, AppError> {
                     &matcher,
                     options,
                     &mut remaining_results,
-                    &mut headings,
-                    &mut writer,
+                    SearchOutput {
+                        writer: &mut writer,
+                        headings: &mut headings,
+                        stats: statistics.as_mut(),
+                    },
                 )
             });
 
@@ -261,6 +344,13 @@ pub fn run() -> Result<SearchOutcome, AppError> {
 
                     terminal::write_diagnostic(&mut diagnostics, &error)
                         .map_err(AppError::Diagnostic)?;
+
+                    if matches!(&error, AppError::Discovery(_))
+                        && let Some(stats) = statistics.as_mut()
+                    {
+                        stats.errors = stats.errors.saturating_add(1);
+                    }
+
                     had_errors = true;
                 }
             }
@@ -272,6 +362,22 @@ pub fn run() -> Result<SearchOutcome, AppError> {
     }
 
     cancellation.check()?;
+
+    if let (Some(stats), Some(started)) = (statistics.as_ref(), started) {
+        let elapsed = started.elapsed();
+
+        match config.output_format {
+            OutputFormat::Terminal => {
+                stats_output::write_summary(&mut diagnostics, stats, elapsed)
+                    .map_err(AppError::Diagnostic)?;
+            }
+            OutputFormat::Json => {
+                if let Err(source) = json::write_summary(&mut writer, stats, elapsed) {
+                    return finish_output_error(source, had_errors, &mut diagnostics);
+                }
+            }
+        }
+    }
 
     if !config.quiet
         && let Err(source) = writer.flush()
@@ -287,6 +393,61 @@ pub fn run() -> Result<SearchOutcome, AppError> {
     } else {
         Ok(SearchOutcome::NoSelection)
     }
+}
+
+fn run_config(command: cli::commands::ConfigCommand) -> Result<SearchOutcome, AppError> {
+    use crate::config::{ResolvedConfig, file};
+
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+
+    let result = match command {
+        cli::commands::ConfigCommand::Show { no_config } => {
+            let settings = if no_config {
+                file::FileConfig::default()
+            } else {
+                file::load(Path::new(file::FILE_NAME))?
+            };
+
+            let resolved = ResolvedConfig::from(settings);
+            json::write_document(&mut writer, &resolved)
+        }
+        cli::commands::ConfigCommand::Path => {
+            let directory = std::env::current_dir().map_err(|source| AppError::Read {
+                path: PathBuf::from("."),
+                source,
+            })?;
+
+            let path = directory.join(file::FILE_NAME);
+            let encoded = json::EncodedPath::from_path(&path);
+
+            json::write_document(&mut writer, &encoded)
+        }
+    };
+
+    if let Err(source) = result.and_then(|()| writer.flush()) {
+        let stderr = io::stderr();
+        let mut diagnostics = stderr.lock();
+
+        return finish_output_error(source, false, &mut diagnostics);
+    }
+
+    Ok(SearchOutcome::Selected)
+}
+
+fn run_completions(shell: cli::commands::CompletionShell) -> Result<SearchOutcome, AppError> {
+    let script = cli::completions::generate(shell);
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+
+    if let Err(source) = writer.write_all(&script).and_then(|()| writer.flush()) {
+        let stderr = io::stderr();
+        let mut diagnostics = stderr.lock();
+
+        return finish_output_error(source, false, &mut diagnostics);
+    }
+
+    Ok(SearchOutcome::Selected)
 }
 
 fn discover_candidates<'a>(
@@ -329,6 +490,7 @@ fn list_files(
     roots: &[PathBuf],
     discovery: &DiscoveryOptions,
     order: ordering::SortOrder,
+    format: OutputFormat,
     options: TerminalOptions,
     quiet: bool,
     cancellation: &CancellationToken,
@@ -373,7 +535,12 @@ fn list_files(
                     break;
                 }
 
-                if let Err(source) = terminal::write_path(&mut writer, &path, options) {
+                let result = match format {
+                    OutputFormat::Terminal => terminal::write_path(&mut writer, &path, options),
+                    OutputFormat::Json => json::write_path(&mut writer, &json::Source::file(&path)),
+                };
+
+                if let Err(source) = result {
                     return finish_output_error(source, had_errors, &mut diagnostics);
                 }
             }
@@ -406,28 +573,35 @@ fn search_file(
     matcher: &PatternMatcher,
     options: FileSearchOptions<'_>,
     remaining_results: &mut Option<usize>,
-    headings: &mut terminal::HeadingState,
-    writer: &mut impl Write,
+    output: SearchOutput<'_, impl Write>,
 ) -> Result<bool, AppError> {
-    let FileSearchOptions {
-        search,
-        terminal,
-        heading,
-    } = options;
+    let SearchOutput {
+        writer,
+        headings,
+        stats,
+    } = output;
 
-    let heading_enabled = heading
-        && !search.quiet
-        && matches!(
-            search.output_mode,
-            OutputMode::Lines | OutputMode::OnlyMatching
-        );
+    let source = json::Source::file(path);
 
     let mut emit = |event| {
-        terminal::write_execution_event(writer, path, event, terminal, heading_enabled, headings)
+        options
+            .write_event(writer, path, &source, event, headings)
             .map_err(AppError::Output)
     };
 
-    sequential::process_file(path, matcher, search, remaining_results, &mut emit)
+    match stats {
+        Some(stats) => sequential::process_file_with_stats(
+            path,
+            matcher,
+            options.search,
+            remaining_results,
+            &mut emit,
+            stats,
+        ),
+        None => {
+            sequential::process_file(path, matcher, options.search, remaining_results, &mut emit)
+        }
+    }
 }
 
 fn search_reader(
@@ -436,28 +610,41 @@ fn search_reader(
     matcher: &PatternMatcher,
     options: FileSearchOptions<'_>,
     remaining_results: &mut Option<usize>,
-    headings: &mut terminal::HeadingState,
-    writer: &mut impl Write,
+    output: SearchOutput<'_, impl Write>,
 ) -> Result<bool, AppError> {
-    let FileSearchOptions {
-        search,
-        terminal,
-        heading,
-    } = options;
+    let SearchOutput {
+        writer,
+        headings,
+        stats,
+    } = output;
 
-    let heading_enabled = heading
-        && !search.quiet
-        && matches!(
-            search.output_mode,
-            OutputMode::Lines | OutputMode::OnlyMatching
-        );
+    let source = json::Source::Stdin;
 
     let mut emit = |event| {
-        terminal::write_execution_event(writer, path, event, terminal, heading_enabled, headings)
+        options
+            .write_event(writer, path, &source, event, headings)
             .map_err(AppError::Output)
     };
 
-    sequential::process_reader(input, path, matcher, search, remaining_results, &mut emit)
+    match stats {
+        Some(stats) => sequential::process_reader_with_stats(
+            input,
+            path,
+            matcher,
+            options.search,
+            remaining_results,
+            &mut emit,
+            stats,
+        ),
+        None => sequential::process_reader(
+            input,
+            path,
+            matcher,
+            options.search,
+            remaining_results,
+            &mut emit,
+        ),
+    }
 }
 
 fn load_path_lists(
@@ -642,6 +829,7 @@ mod tests {
             },
             terminal: TerminalOptions::default(),
             heading: false,
+            format: OutputFormat::Terminal,
         };
 
         let mut input = io::Cursor::new(b"Rust\n");
@@ -655,8 +843,11 @@ mod tests {
             &matcher,
             options,
             &mut remaining_results,
-            &mut headings,
-            &mut output,
+            SearchOutput {
+                writer: &mut output,
+                headings: &mut headings,
+                stats: None,
+            },
         );
 
         assert!(matches!(result, Err(AppError::Cancelled)));
@@ -772,6 +963,7 @@ mod tests {
                 },
                 terminal: TerminalOptions::default(),
                 heading: false,
+                format: OutputFormat::Terminal,
             };
 
             let mut remaining_results = None;
@@ -784,8 +976,11 @@ mod tests {
                 &matcher,
                 options,
                 &mut remaining_results,
-                &mut headings,
-                &mut output,
+                SearchOutput {
+                    writer: &mut output,
+                    headings: &mut headings,
+                    stats: None,
+                },
             );
 
             assert!(

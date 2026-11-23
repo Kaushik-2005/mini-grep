@@ -9,6 +9,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 
 use super::cancel::CancellationToken;
+use super::stats::SearchStats;
 use super::{ExecutionEvent, SearchOptions, sequential};
 use crate::AppError;
 use crate::search::PatternMatcher;
@@ -22,12 +23,14 @@ pub(crate) enum ParallelEvent<'a> {
         path: &'a Path,
         event: ExecutionEvent,
     },
+    Statistics(SearchStats),
     Finished(Result<bool, AppError>),
     DiscoveryError(AppError),
 }
 
 enum WorkerMessage {
     Output(ExecutionEvent),
+    Statistics(SearchStats),
     Finished(Result<bool, AppError>),
 }
 
@@ -52,6 +55,27 @@ pub(crate) fn run(
     threads: NonZeroUsize,
     handle: &mut impl FnMut(ParallelEvent<'_>) -> Result<(), AppError>,
 ) -> Result<(), AppError> {
+    run_inner(candidates, matcher, options, threads, false, handle)
+}
+
+pub(crate) fn run_with_stats(
+    candidates: impl Iterator<Item = Result<PathBuf, AppError>>,
+    matcher: &PatternMatcher,
+    options: SearchOptions<'_>,
+    threads: NonZeroUsize,
+    handle: &mut impl FnMut(ParallelEvent<'_>) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    run_inner(candidates, matcher, options, threads, true, handle)
+}
+
+pub(crate) fn run_inner(
+    candidates: impl Iterator<Item = Result<PathBuf, AppError>>,
+    matcher: &PatternMatcher,
+    options: SearchOptions<'_>,
+    threads: NonZeroUsize,
+    collect_stats: bool,
+    handle: &mut impl FnMut(ParallelEvent<'_>) -> Result<(), AppError>,
+) -> Result<(), AppError> {
     thread::scope(|scope| {
         let (jobs_sender, jobs_receiver) = bounded(JOB_QUEUE_CAPACITY);
         let mut workers = Vec::new();
@@ -64,7 +88,7 @@ pub(crate) fn run(
                 let worker = thread::Builder::new()
                     .name(format!("mini-grep-worker-{index}"))
                     .spawn_scoped(scope, move || {
-                        worker_loop(jobs, matcher, options);
+                        worker_loop(jobs, matcher, options, collect_stats);
                     })
                     .map_err(AppError::Worker)?;
 
@@ -164,6 +188,9 @@ fn coordinate(
                         event,
                     })?;
                 }
+                Ok(WorkerMessage::Statistics(stats)) => {
+                    handle(ParallelEvent::Statistics(stats))?;
+                }
                 Ok(WorkerMessage::Finished(result)) => {
                     handle(ParallelEvent::Finished(result))?;
                     break;
@@ -179,13 +206,19 @@ fn coordinate(
     }
 }
 
-fn worker_loop(jobs: Receiver<Job>, matcher: &PatternMatcher, options: SearchOptions<'_>) {
+fn worker_loop(
+    jobs: Receiver<Job>,
+    matcher: &PatternMatcher,
+    options: SearchOptions<'_>,
+    collect_stats: bool,
+) {
     while let Ok(job) = jobs.recv() {
         if options.cancellation.is_cancelled() {
             break;
         }
 
         let mut remaining_results = None;
+        let mut stats = SearchStats::default();
 
         let mut emit = |event| {
             job.output
@@ -193,16 +226,33 @@ fn worker_loop(jobs: Receiver<Job>, matcher: &PatternMatcher, options: SearchOpt
                 .map_err(|_| AppError::Cancelled)
         };
 
-        let result = sequential::process_file(
-            job.path.as_path(),
-            matcher,
-            options,
-            &mut remaining_results,
-            &mut emit,
-        );
+        let result = if collect_stats {
+            sequential::process_file_with_stats(
+                job.path.as_path(),
+                matcher,
+                options,
+                &mut remaining_results,
+                &mut emit,
+                &mut stats,
+            )
+        } else {
+            sequential::process_file(
+                job.path.as_path(),
+                matcher,
+                options,
+                &mut remaining_results,
+                &mut emit,
+            )
+        };
+
+        if collect_stats && job.output.send(WorkerMessage::Statistics(stats)).is_err() {
+            break;
+        }
 
         // A closed receiver means the coordinator has stopped this work.
-        let _ = job.output.send(WorkerMessage::Finished(result));
+        if job.output.send(WorkerMessage::Finished(result)).is_err() {
+            break;
+        }
     }
 }
 
@@ -392,5 +442,62 @@ mod tests {
 
         assert!(matches!(result, Err(AppError::Output(_))));
         assert_eq!(observed, Some((EVENT_QUEUE_CAPACITY + 1, true)));
+    }
+
+    #[test]
+    fn coordinator_forwards_partial_stats_once_before_file_failure() {
+        let cancellation = CancellationToken::default();
+        let (jobs_sender, jobs_receiver) = bounded::<Job>(1);
+
+        let expected = SearchStats {
+            inputs_started: 1,
+            inputs_with_selected_lines: 1,
+            selected_lines: 2,
+            matches: 3,
+            errors: 1,
+        };
+
+        let worker = thread::spawn(move || {
+            let job = jobs_receiver.recv().expect("job must arrive");
+
+            job.output
+                .send(WorkerMessage::Statistics(expected))
+                .expect("statistics must reach the coordinator");
+
+            job.output
+                .send(WorkerMessage::Finished(Err(AppError::Read {
+                    path: job.path.as_ref().clone(),
+                    source: io::Error::new(io::ErrorKind::InvalidData, "invalid input"),
+                })))
+                .expect("completion must reach the coordinator");
+        });
+
+        let candidates = std::iter::once(Ok(PathBuf::from("sample.txt")));
+        let mut total = SearchStats::default();
+        let mut sequence = Vec::new();
+
+        let mut handle = |event: ParallelEvent<'_>| {
+            match event {
+                ParallelEvent::Statistics(stats) => {
+                    total.merge(stats);
+                    sequence.push("statistics");
+                }
+                ParallelEvent::Finished(Err(AppError::Read { .. })) => {
+                    sequence.push("read error");
+                }
+                _ => panic!("unexpected parallel event"),
+            }
+
+            Ok(())
+        };
+
+        let result = coordinate(candidates, &jobs_sender, 1, &cancellation, &mut handle);
+
+        drop(jobs_sender);
+        worker.join().expect("test worker must finish");
+
+        assert!(result.is_ok());
+        assert_eq!(sequence, ["statistics", "read error"]);
+        assert_eq!(total, expected);
     }
 }

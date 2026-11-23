@@ -8,6 +8,7 @@ use crate::discovery::DiscoveryOptions;
 use crate::execution::OutputMode;
 use crate::execution::ordering::SortOrder;
 use crate::input::binary::BinaryPolicy;
+use crate::output::OutputFormat;
 use crate::output::color::ColorPolicy;
 use crate::search::{CaseMode, MatchScope, PatternMode, PatternOptions, Selection};
 
@@ -176,7 +177,9 @@ pub(crate) struct Config {
     pub(crate) max_count: Option<usize>,
     pub(crate) max_results: Option<usize>,
     pub(crate) quiet: bool,
+    pub(crate) stats: bool,
     pub(crate) output_mode: OutputMode,
+    pub(crate) output_format: OutputFormat,
     pub(crate) show_filename: bool,
     pub(crate) column: bool,
     pub(crate) heading: bool,
@@ -193,6 +196,13 @@ impl TryFrom<Args> for Config {
     type Error = AppError;
 
     fn try_from(args: Args) -> Result<Self, Self::Error> {
+        if args.stats && args.quiet {
+            return Err(AppError::Usage("--stats and --quiet cannot be combined"));
+        }
+
+        if args.stats && args.files {
+            return Err(AppError::Usage("--stats and --files cannot be combined"));
+        }
         if args.ignore_case && args.smart_case {
             return Err(AppError::Usage("-i and -S cannot be combined"));
         }
@@ -345,7 +355,13 @@ impl TryFrom<Args> for Config {
             heading: args.heading,
             null: args.null,
             quiet: args.quiet,
+            stats: args.stats,
             output_mode,
+            output_format: if args.json {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Terminal
+            },
             before_context: args.before_context.or(args.context).unwrap_or(0),
             after_context: args.after_context.or(args.context).unwrap_or(0),
             max_count: args.max_count,
@@ -1314,5 +1330,130 @@ mod tests {
         args.text = true;
 
         assert!(matches!(Config::try_from(args), Err(AppError::Usage(_))));
+    }
+
+    #[test]
+    fn output_format_defaults_to_terminal() {
+        let args = Args::try_parse_from(["mini-grep", "Rust", "sample.txt"])
+            .expect("valid arguments must parse");
+        let config = Config::try_from(args).expect("valid arguments must produce configuration");
+
+        assert_eq!(config.output_format, OutputFormat::Terminal);
+    }
+
+    #[test]
+    fn json_selects_structured_output() {
+        let args = Args::try_parse_from(["mini-grep", "--json", "Rust", "sample.txt"])
+            .expect("JSON arguments must parse");
+        let config = Config::try_from(args).expect("JSON arguments must produce configuration");
+
+        assert_eq!(config.output_format, OutputFormat::Json);
+        assert_eq!(config.output_mode, OutputMode::Lines);
+    }
+
+    #[test]
+    fn json_preserves_result_modes() {
+        for (flag, expected) in [
+            ("-c", OutputMode::CountLines),
+            ("--count-matches", OutputMode::CountMatches),
+            ("-o", OutputMode::OnlyMatching),
+            ("-l", OutputMode::FilesWithMatches),
+            ("--files-without-match", OutputMode::FilesWithoutMatch),
+        ] {
+            let args = Args::try_parse_from(["mini-grep", "--json", flag, "Rust", "sample.txt"])
+                .expect("JSON result mode must parse");
+            let config =
+                Config::try_from(args).expect("JSON result mode must produce configuration");
+
+            assert_eq!(config.output_format, OutputFormat::Json);
+            assert_eq!(config.output_mode, expected, "flag: {flag}");
+        }
+    }
+
+    #[test]
+    fn json_accepts_file_enumeration_and_quiet() {
+        let args = Args::try_parse_from(["mini-grep", "--json", "--files", "-q", "."])
+            .expect("JSON enumeration must parse");
+        let config = Config::try_from(args).expect("JSON enumeration must produce configuration");
+
+        assert_eq!(config.output_format, OutputFormat::Json);
+        assert!(config.files);
+        assert!(config.quiet);
+    }
+
+    #[test]
+    fn json_accepts_terminal_presentation_options() {
+        for flags in [
+            vec!["-n", "--column", "-H", "--heading", "--color=always"],
+            vec!["-h", "-0", "--color=never"],
+        ] {
+            let mut arguments = vec!["mini-grep", "--json"];
+            arguments.extend(flags);
+            arguments.extend(["Rust", "sample.txt"]);
+
+            let args =
+                Args::try_parse_from(arguments).expect("JSON presentation arguments must parse");
+            let config = Config::try_from(args)
+                .expect("JSON presentation arguments must produce configuration");
+
+            assert_eq!(config.output_format, OutputFormat::Json);
+        }
+    }
+
+    #[test]
+    fn statistics_are_disabled_by_default() {
+        let args = Args::try_parse_from(["mini-grep", "Rust", "sample.txt"])
+            .expect("valid arguments must parse");
+        let config = Config::try_from(args).expect("valid arguments must produce configuration");
+
+        assert!(!config.stats);
+    }
+
+    #[test]
+    fn statistics_support_terminal_and_json_output() {
+        for (arguments, expected_format) in [
+            (
+                vec!["mini-grep", "--stats", "Rust", "sample.txt"],
+                OutputFormat::Terminal,
+            ),
+            (
+                vec!["mini-grep", "--stats", "--json", "Rust", "sample.txt"],
+                OutputFormat::Json,
+            ),
+        ] {
+            let args = Args::try_parse_from(arguments).expect("statistics arguments must parse");
+            let config =
+                Config::try_from(args).expect("statistics arguments must produce configuration");
+
+            assert!(config.stats);
+            assert_eq!(config.output_format, expected_format);
+        }
+    }
+
+    #[test]
+    fn statistics_conflict_with_quiet_and_file_enumeration() {
+        for arguments in [
+            vec!["mini-grep", "--stats", "-q", "Rust", "sample.txt"],
+            vec!["mini-grep", "--stats", "--files", "."],
+        ] {
+            let error = Args::try_parse_from(arguments)
+                .expect_err("incompatible statistics options must fail");
+
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn configuration_rejects_statistics_conflicts_without_reparsing() {
+        for enumeration in [false, true] {
+            let mut args = Args::try_parse_from(["mini-grep", "Rust", "sample.txt"])
+                .expect("valid arguments must parse");
+
+            args.stats = true;
+            args.files = enumeration;
+            args.quiet = !enumeration;
+
+            assert!(matches!(Config::try_from(args), Err(AppError::Usage(_))));
+        }
     }
 }

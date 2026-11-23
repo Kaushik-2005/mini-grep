@@ -8,14 +8,24 @@ pub enum AppError {
     Usage(&'static str),
     Cli(Box<clap::Error>),
     Discovery(Box<ignore::Error>),
-    Open { path: PathBuf, source: io::Error },
-    Read { path: PathBuf, source: io::Error },
+    Open {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
     Output(io::Error),
     Diagnostic(io::Error),
     Pattern(Box<::regex::Error>),
     Cancelled,
     Signal(ctrlc::Error),
     Worker(io::Error),
+    ConfigParse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
 }
 
 impl fmt::Display for AppError {
@@ -48,6 +58,13 @@ impl fmt::Display for AppError {
                 write!(formatter, "cannot execute search worker: {source}")
             }
             Self::Cancelled => write!(formatter, "operation cancelled"),
+            Self::ConfigParse { path, source } => {
+                write!(
+                    formatter,
+                    "cannot parse configuration '{}': {source}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -65,6 +82,7 @@ impl Error for AppError {
             Self::Pattern(error) => Some(error.as_ref()),
             Self::Worker(source) => Some(source),
             Self::Signal(source) => Some(source),
+            Self::ConfigParse { source, .. } => Some(source),
         }
     }
 }

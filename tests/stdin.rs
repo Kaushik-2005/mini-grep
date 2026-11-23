@@ -520,3 +520,484 @@ fn stdin_text_override_still_reports_invalid_utf8() {
     assert!(stderr.contains("cannot read"), "{stderr}");
     assert!(stderr.contains("(standard input)"), "{stderr}");
 }
+
+#[test]
+fn json_stdin_emits_source_identity_and_byte_spans() {
+    let output = run_with_stdin(
+        &[
+            "--json",
+            "-n",
+            "--column",
+            "--heading",
+            "--color=always",
+            "Rust",
+            "-",
+        ],
+        "é Rust\n".as_bytes(),
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+        .collect();
+
+    assert_eq!(
+        records,
+        vec![
+            serde_json::json!({
+                "schema_version": 1,
+                "source": { "kind": "stdin" },
+                "type": "begin"
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "source": { "kind": "stdin" },
+                "type": "line",
+                "line_number": 1,
+                "selected": true,
+                "text": "é Rust",
+                "spans": [{ "start": 3, "end": 7 }]
+            })
+        ]
+    );
+    assert!(stdout.ends_with('\n'));
+    assert!(!stdout.contains('\u{1b}'));
+}
+
+#[test]
+fn quiet_json_search_suppresses_all_records() {
+    for (contents, expected_status) in [(b"Rust\n".as_slice(), 0), (b"Go\n".as_slice(), 1)] {
+        let output = run_with_stdin(&["--json", "-q", "Rust", "-"], contents);
+
+        assert_eq!(output.status.code(), Some(expected_status));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn json_counts_distinguish_selected_lines_from_matches() {
+    for (flag, expected_count, expected_unit) in [
+        ("-c", "2", "selected_lines"),
+        ("--count-matches", "3", "matches"),
+    ] {
+        let output = run_with_stdin(&["--json", flag, "Rust", "-"], b"Rust Rust\nGo\nRust\n");
+
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+        let records: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+            .collect();
+
+        assert_eq!(
+            records,
+            vec![
+                serde_json::json!({
+                    "schema_version": 1,
+                    "source": { "kind": "stdin" },
+                    "type": "begin"
+                }),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "source": { "kind": "stdin" },
+                    "type": "count",
+                    "count": expected_count,
+                    "unit": expected_unit
+                })
+            ],
+            "flag: {flag}"
+        );
+        assert!(stdout.ends_with('\n'));
+    }
+}
+
+#[test]
+fn json_only_matching_preserves_original_byte_offsets() {
+    let output = run_with_stdin(&["--json", "-o", "Rust", "-"], "é Rust Rust\n".as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+        .collect();
+
+    assert_eq!(
+        records,
+        vec![
+            serde_json::json!({
+                "schema_version": 1,
+                "source": { "kind": "stdin" },
+                "type": "begin"
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "source": { "kind": "stdin" },
+                "type": "match",
+                "line_number": 1,
+                "text": "Rust",
+                "start": 3,
+                "end": 7
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "source": { "kind": "stdin" },
+                "type": "match",
+                "line_number": 1,
+                "text": "Rust",
+                "start": 8,
+                "end": 12
+            })
+        ]
+    );
+    assert!(stdout.ends_with('\n'));
+}
+
+#[test]
+fn json_context_marks_selected_lines_and_separates_groups() {
+    let output = run_with_stdin(
+        &["--json", "-C", "1", "Rust", "-"],
+        b"before\nRust\nafter\nskip\nskip\nbefore\nRust\nafter\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+        .collect();
+
+    let types: Vec<_> = records
+        .iter()
+        .map(|record| {
+            record["type"]
+                .as_str()
+                .expect("record type must be a string")
+        })
+        .collect();
+
+    assert_eq!(
+        types,
+        [
+            "begin",
+            "line",
+            "line",
+            "line",
+            "group_break",
+            "line",
+            "line",
+            "line",
+        ]
+    );
+
+    let lines: Vec<_> = records
+        .iter()
+        .filter(|record| record["type"] == "line")
+        .map(|record| {
+            serde_json::json!({
+                "line_number": record["line_number"],
+                "selected": record["selected"],
+                "text": record["text"],
+                "spans": record["spans"]
+            })
+        })
+        .collect();
+
+    let expected: Vec<_> = [
+        (1, false, "before"),
+        (2, true, "Rust"),
+        (3, false, "after"),
+        (6, false, "before"),
+        (7, true, "Rust"),
+        (8, false, "after"),
+    ]
+    .into_iter()
+    .map(|(line_number, selected, text)| {
+        let spans = if selected {
+            serde_json::json!([{ "start": 0, "end": 4 }])
+        } else {
+            serde_json::json!([])
+        };
+
+        serde_json::json!({
+            "line_number": line_number,
+            "selected": selected,
+            "text": text,
+            "spans": spans
+        })
+    })
+    .collect();
+
+    assert_eq!(lines, expected);
+
+    for record in &records {
+        assert_eq!(record["schema_version"], 1);
+        assert_eq!(record["source"], serde_json::json!({ "kind": "stdin" }));
+    }
+
+    assert!(stdout.ends_with('\n'));
+}
+
+#[test]
+fn json_read_errors_preserve_completed_records_and_use_stderr() {
+    let output = run_with_stdin(&["--json", "Rust", "-"], b"Rust\n\xff\n");
+
+    assert_eq!(output.status.code(), Some(2));
+
+    let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+        .collect();
+
+    assert_eq!(
+        records,
+        vec![
+            serde_json::json!({
+                "schema_version": 1,
+                "source": { "kind": "stdin" },
+                "type": "begin"
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "source": { "kind": "stdin" },
+                "type": "line",
+                "line_number": 1,
+                "selected": true,
+                "text": "Rust",
+                "spans": [{ "start": 0, "end": 4 }]
+            })
+        ]
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("diagnostic must be UTF-8");
+    assert!(stderr.contains("mini-grep:"), "{stderr}");
+    assert!(stderr.contains("(standard input)"), "{stderr}");
+    assert!(stdout.ends_with('\n'));
+}
+
+#[test]
+fn json_search_without_matches_returns_one_and_only_begin() {
+    for contents in [b"Go\n".as_slice(), b"".as_slice()] {
+        let output = run_with_stdin(&["--json", "Rust", "-"], contents);
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+
+        let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+        let records: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+            .collect();
+
+        assert_eq!(
+            records,
+            vec![serde_json::json!({
+                "schema_version": 1,
+                "source": { "kind": "stdin" },
+                "type": "begin"
+            })]
+        );
+        assert!(stdout.ends_with('\n'));
+    }
+}
+
+#[test]
+fn json_only_matching_skips_zero_width_matches() {
+    let output = run_with_stdin(&["--json", "-o", "^", "-"], b"Rust\n");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+        .collect();
+
+    assert_eq!(
+        records,
+        vec![serde_json::json!({
+            "schema_version": 1,
+            "source": { "kind": "stdin" },
+            "type": "begin"
+        })]
+    );
+    assert!(stdout.ends_with('\n'));
+}
+
+#[test]
+fn json_statistics_emit_a_final_run_summary() {
+    let output = run_with_stdin(
+        &["--json", "--stats", "Rust", "-"],
+        b"Rust Rust\nGo\nRust\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+        .collect();
+
+    assert_eq!(records.len(), 4);
+
+    let summary = records.last().expect("summary must be present");
+    assert_eq!(summary["schema_version"], 1);
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["inputs_started"], "1");
+    assert_eq!(summary["inputs_with_selected_lines"], "1");
+    assert_eq!(summary["selected_lines"], "2");
+    assert_eq!(summary["matches"], "3");
+    assert_eq!(summary["errors"], "0");
+    assert!(summary.get("source").is_none());
+
+    summary["elapsed_nanoseconds"]
+        .as_str()
+        .expect("elapsed time must be a decimal string")
+        .parse::<u128>()
+        .expect("elapsed time must be an unsigned integer");
+
+    assert!(stdout.ends_with('\n'));
+}
+
+fn parse_json_statistics(output: &Output) -> serde_json::Value {
+    let stdout = std::str::from_utf8(&output.stdout).expect("JSON output must be UTF-8");
+
+    assert!(stdout.ends_with('\n'));
+
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record must be valid JSON"))
+        .collect();
+
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["type"] == "summary")
+            .count(),
+        1
+    );
+
+    let summary = records.last().expect("summary must be present");
+    assert_eq!(summary["schema_version"], 1);
+    assert_eq!(summary["type"], "summary");
+    assert!(summary.get("source").is_none());
+
+    summary["elapsed_nanoseconds"]
+        .as_str()
+        .expect("elapsed time must be a decimal string")
+        .parse::<u128>()
+        .expect("elapsed time must be an unsigned integer");
+
+    summary.clone()
+}
+
+#[test]
+fn statistics_preserve_partial_progress_without_double_counting_errors() {
+    let output = run_with_stdin(&["--json", "--stats", "Rust", "-"], b"Rust\n\xff\n");
+
+    assert_eq!(output.status.code(), Some(2));
+
+    let summary = parse_json_statistics(&output);
+    assert_eq!(summary["inputs_started"], "1");
+    assert_eq!(summary["inputs_with_selected_lines"], "1");
+    assert_eq!(summary["selected_lines"], "1");
+    assert_eq!(summary["matches"], "1");
+    assert_eq!(summary["errors"], "1");
+
+    let stderr = String::from_utf8(output.stderr).expect("diagnostic must be UTF-8");
+    assert!(stderr.contains("mini-grep:"), "{stderr}");
+    assert!(stderr.contains("(standard input)"), "{stderr}");
+}
+
+#[test]
+fn zero_limits_emit_only_an_empty_statistics_summary() {
+    for limit in ["-m", "--max-results"] {
+        let output = run_with_stdin(
+            &["--json", "--stats", limit, "0", "Rust", "-"],
+            b"Rust\n\xff\n",
+        );
+
+        assert_eq!(output.status.code(), Some(1), "limit: {limit}");
+        assert!(output.stderr.is_empty());
+
+        let summary = parse_json_statistics(&output);
+        assert_eq!(summary["inputs_started"], "0");
+        assert_eq!(summary["inputs_with_selected_lines"], "0");
+        assert_eq!(summary["selected_lines"], "0");
+        assert_eq!(summary["matches"], "0");
+        assert_eq!(summary["errors"], "0");
+
+        let stdout = std::str::from_utf8(&output.stdout).expect("JSON output must be UTF-8");
+        assert_eq!(stdout.lines().count(), 1);
+    }
+}
+
+#[test]
+fn terminal_statistics_use_stderr_and_preserve_result_stdout() {
+    let output = run_with_stdin(
+        &["--stats", "-c", "-h", "Rust", "-"],
+        b"Rust Rust\nGo\nRust\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"2\n");
+
+    let stderr = String::from_utf8(output.stderr).expect("summary must be UTF-8");
+    let lines: Vec<_> = stderr.lines().collect();
+
+    assert_eq!(lines.len(), 6);
+    assert_eq!(
+        &lines[..5],
+        [
+            "inputs_started: 1",
+            "inputs_with_selected_lines: 1",
+            "selected_lines: 2",
+            "matches: 3",
+            "errors: 0",
+        ]
+    );
+
+    let elapsed = lines[5]
+        .strip_prefix("elapsed_seconds: ")
+        .expect("summary must identify elapsed seconds")
+        .parse::<f64>()
+        .expect("elapsed seconds must be numeric");
+
+    assert!(elapsed.is_finite());
+    assert!(elapsed >= 0.0);
+}

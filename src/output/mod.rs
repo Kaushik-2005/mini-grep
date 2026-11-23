@@ -1,4 +1,6 @@
 pub(crate) mod color;
+pub(crate) mod json;
+pub(crate) mod stats;
 pub(crate) mod terminal;
 
 #[derive(Debug, Clone, Copy)]
@@ -20,4 +22,11 @@ impl Default for TerminalOptions {
             color: false,
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputFormat {
+    #[default]
+    Terminal,
+    Json,
 }

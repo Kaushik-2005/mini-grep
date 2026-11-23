@@ -22,7 +22,7 @@ pub(crate) enum SortArg {
     name = "mini-grep",
     version,
     about = "Search UTF-8 files in a file or directory.",
-    override_usage = "mini-grep [OPTIONS] <PATTERN> [PATH]\n       mini-grep [OPTIONS] (-e <PATTERN> | -f <FILE>)... [PATH]\n       mini-grep --files [OPTIONS] [PATH]",
+    override_usage = "mini-grep [OPTIONS] <PATTERN> [PATH]\n       mini-grep [OPTIONS] (-e <PATTERN> | -f <FILE>)... [PATH]\n       mini-grep --files [OPTIONS] [PATH]\n       mini-grep config <COMMAND>\n       mini-grep completions <SHELL>",
     disable_help_flag = true
 )]
 pub(crate) struct Args {
@@ -186,6 +186,18 @@ pub(crate) struct Args {
     /// Include one-based byte columns and line numbers
     #[arg(long)]
     pub(crate) column: bool,
+
+    /// Write structured JSON Lines instead of terminal output
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// Report search counters and elapsed time
+    #[arg(long, conflicts_with_all = ["quiet", "files"])]
+    pub(crate) stats: bool,
+
+    /// Ignore the local configuration file
+    #[arg(long)]
+    pub(crate) no_config: bool,
 
     /// Control match highlighting
     #[arg(long, value_enum, default_value = "auto", value_name = "WHEN")]
