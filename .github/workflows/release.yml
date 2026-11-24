@@ -105,3 +105,9 @@ jobs:
           if (($grepActualLines -join "`n") -cne ($grepExpectedLines -join "`n")) {
               throw 'Release executable returned unexpected search output.'
           }
+
+      - name: Install license notice generator
+        run: cargo +stable install cargo-about --version 0.9.3 --locked --features cli
+
+      - name: Generate dependency notices
+        run: cargo +stable about generate --locked --all-features --fail --output-file target/THIRD-PARTY-NOTICES.txt scripts/licenses.hbs

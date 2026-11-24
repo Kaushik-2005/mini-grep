@@ -1,0 +1,18 @@
+Third-party notices for mini-grep
+
+Dependency license information for the configured release targets.
+mini-grep's own licenses are provided in LICENSE-MIT and LICENSE-APACHE.
+
+{{#each licenses}}
+========================================================================
+{{{name}}} ({{{id}}})
+========================================================================
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

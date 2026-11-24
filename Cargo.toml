@@ -11,6 +11,8 @@ include = [
     "Cargo.lock",
     "LICENSE-MIT",
     "LICENSE-APACHE",
+    "about.toml",
+    "scripts/licenses.hbs",
     "src/**",
     "tests/**",
     "benches/**",
