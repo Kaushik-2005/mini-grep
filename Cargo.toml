@@ -13,6 +13,7 @@ include = [
     "LICENSE-APACHE",
     "about.toml",
     "scripts/licenses.hbs",
+    "scripts/package-release.ps1",
     "src/**",
     "tests/**",
     "benches/**",
