@@ -129,6 +129,8 @@ fn with_scope(expression: &str, scope: MatchScope) -> Result<String, ::regex::Er
 mod tests {
     use super::*;
 
+    use proptest::prelude::*;
+
     fn matcher(patterns: &[&str], options: PatternOptions) -> PatternMatcher {
         let patterns: Vec<String> = patterns
             .iter()
@@ -136,6 +138,84 @@ mod tests {
             .collect();
 
         PatternMatcher::new(&patterns, options).expect("valid patterns must compile")
+    }
+
+    fn literal_property_text(max_chars: usize) -> impl Strategy<Value = String> {
+        let arbitrary = any::<char>().prop_filter("single-line character", |character| {
+            !matches!(*character, '\n' | '\r')
+        });
+
+        let character = prop_oneof![
+            6 => proptest::sample::select(vec![
+                'a', 'b', 'R', 'u', 's', 't',
+                '\u{e9}', '\u{928}', '\u{1f980}',
+                '.', '[', ']', '(', ')', '*', '+', '?',
+                '\\', '^', '$', '|',
+            ]),
+            1 => arbitrary,
+        ];
+
+        proptest::collection::vec(character, 0..=max_chars)
+            .prop_map(|characters| characters.into_iter().collect())
+    }
+
+    fn literal_property_case() -> impl Strategy<Value = (String, String)> {
+        let independent = (literal_property_text(8), literal_property_text(64));
+
+        let planted = (
+            literal_property_text(8),
+            literal_property_text(24),
+            literal_property_text(24),
+        )
+            .prop_map(|(pattern, prefix, suffix)| {
+                let line = format!("{prefix}{pattern}{suffix}");
+                (pattern, line)
+            });
+
+        prop_oneof![independent, planted]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn compiled_literal_matching_agrees_with_public_search(
+            (pattern, line) in literal_property_case(),
+        ) {
+            // The newline represents one input line even when it is empty.
+            let reference_text = format!("{line}\n");
+            let reference = crate::search::search(&pattern, &reference_text);
+            let has_match = !reference.is_empty();
+
+            let expected_spans = reference
+                .first()
+                .map(|matched| matched.spans.as_slice())
+                .unwrap_or(&[]);
+
+            for selection in [Selection::Matching, Selection::NonMatching] {
+                let compiled = matcher(
+                    &[pattern.as_str()],
+                    PatternOptions {
+                        mode: PatternMode::Literal,
+                        selection,
+                        ..PatternOptions::default()
+                    },
+                );
+
+                let expected_selection = match selection {
+                    Selection::Matching => has_match,
+                    Selection::NonMatching => !has_match,
+                };
+
+                prop_assert_eq!(
+                    compiled.is_selected(&line),
+                    expected_selection
+                );
+
+                let spans = compiled.find_spans(&line);
+                prop_assert_eq!(spans.as_slice(), expected_spans);
+            }
+        }
     }
 
     #[test]

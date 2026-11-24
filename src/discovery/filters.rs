@@ -51,6 +51,54 @@ pub(super) fn compile_types(included: &[String], excluded: &[String]) -> Result<
 mod tests {
     use super::*;
 
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn last_matching_glob_controls_generated_paths(
+            directories in proptest::collection::vec("[a-z]{1,8}", 0..5),
+            stem in "[a-z]{1,12}",
+            decisions in proptest::collection::vec(any::<bool>(), 1..17),
+        ) {
+            let mut path = std::path::PathBuf::new();
+
+            for directory in directories {
+                path.push(directory);
+            }
+
+            path.push(format!("{stem}.rs"));
+
+            let expected_inclusion = decisions
+                .last()
+                .copied()
+                .expect("strategy produces at least one rule");
+
+            let mut patterns: Vec<String> = decisions
+                .iter()
+                .map(|include| {
+                    if *include {
+                        String::from("*.rs")
+                    } else {
+                        String::from("!*.rs")
+                    }
+                })
+                .collect();
+
+            // This final rule must not change the Rust file's decision.
+            patterns.push(String::from("!*.txt"));
+
+            let matcher = compile_globs(Path::new("project"), &patterns)
+                .expect("generated globs must compile");
+
+            let result = matcher.matched(&path, false);
+
+            prop_assert_eq!(result.is_whitelist(), expected_inclusion);
+            prop_assert_eq!(result.is_ignore(), !expected_inclusion);
+        }
+    }
+
     fn compile(patterns: &[&str]) -> Override {
         let patterns: Vec<String> = patterns
             .iter()

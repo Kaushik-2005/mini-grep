@@ -17,6 +17,7 @@ serde_json = "1.0.154"
 
 [dev-dependencies]
 criterion = "0.8.2"
+proptest = "1"
 
 [[bench]]
 name = "literal"
