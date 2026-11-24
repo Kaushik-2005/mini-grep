@@ -43,7 +43,7 @@ jobs:
         run: cargo +stable doc --locked --no-deps --all-features
 
   tests:
-    name: Tests (${{ matrix.os }})
+    name: Tests (${{ matrix.os }}, Rust ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
@@ -54,6 +54,9 @@ jobs:
           - ubuntu-latest
           - windows-latest
           - macos-latest
+        rust:
+          - stable
+          - "1.88.0"
 
     steps:
       - name: Check out repository
@@ -61,8 +64,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+      - name: Install Rust toolchain
+        run: rustup toolchain install ${{ matrix.rust }} --profile minimal
+
+      - name: Check all targets
+        run: cargo +${{ matrix.rust }} check --locked --all-targets --all-features
 
       - name: Run tests
-        run: cargo +stable test --locked --all-features
+        run: cargo +${{ matrix.rust }} test --locked --all-features
