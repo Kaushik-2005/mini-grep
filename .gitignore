@@ -8,3 +8,5 @@
 *.md
 
 !README.md
+!docs/cli-contract.md
+!CHANGELOG.md

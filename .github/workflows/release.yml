@@ -1,0 +1,107 @@
+name: Release artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            suffix: ".exe"
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            suffix: ""
+
+    env:
+      GREP_RELEASE_TARGET: ${{ matrix.target }}
+      GREP_BINARY_SUFFIX: ${{ matrix.suffix }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --target $env:GREP_RELEASE_TARGET
+
+      - name: Build release executable
+        run: cargo +stable build --locked --release --all-features --bin mini-grep --target $env:GREP_RELEASE_TARGET
+
+      - name: Check executable version and search output
+        run: |
+          $grepMetadataJson = cargo +stable metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Cannot read package metadata.'
+          }
+
+          $grepMetadata = $grepMetadataJson | ConvertFrom-Json
+          $grepPackages = @(
+              $grepMetadata.packages |
+                  Where-Object { $_.name -eq 'mini-grep' }
+          )
+
+          if ($grepPackages.Count -ne 1) {
+              throw 'Expected exactly one mini-grep package.'
+          }
+
+          $grepBinary = Join-Path (Get-Location).Path (
+              "target/$env:GREP_RELEASE_TARGET/release/mini-grep$env:GREP_BINARY_SUFFIX"
+          )
+
+          $grepExpectedVersion = "mini-grep $($grepPackages[0].version)"
+          $grepActualVersion = @(& $grepBinary --version)
+
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Installed version check failed.'
+          }
+
+          if (($grepActualVersion -join "`n") -cne $grepExpectedVersion) {
+              throw "Expected version output: $grepExpectedVersion"
+          }
+
+          $grepExpectedLines = @(
+              '2:Rust makes ownership explicit.'
+              '4:Rust rewards careful design.'
+          )
+
+          $grepActualLines = @(
+              & $grepBinary --no-config --color=never -F -n -h Rust tests/fixtures/text/demo.txt
+          )
+
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Release executable search failed.'
+          }
+
+          if (($grepActualLines -join "`n") -cne ($grepExpectedLines -join "`n")) {
+              throw 'Release executable returned unexpected search output.'
+          }

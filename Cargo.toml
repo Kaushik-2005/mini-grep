@@ -3,6 +3,22 @@ name = "mini-grep"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+description = "Search files, directories, and standard input with a standalone Rust CLI."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "src/**",
+    "tests/**",
+    "benches/**",
+    "proptest-regressions/**",
+    "README.md",
+    "docs/cli-contract.md",
+    "CHANGELOG.md",
+]
 
 [dependencies]
 anstream = "1"
